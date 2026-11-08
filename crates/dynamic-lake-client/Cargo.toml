@@ -1,0 +1,18 @@
+[package]
+name = "dynamic-lake-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+datafusion.workspace = true
+dynamic-lake-core = { path = "../dynamic-lake-core" }
+dynamic-lake-datafusion = { path = "../dynamic-lake-datafusion" }
+dynamic-lake-format = { path = "../dynamic-lake-format" }
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

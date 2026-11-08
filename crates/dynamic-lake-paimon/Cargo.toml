@@ -1,0 +1,26 @@
+[package]
+name = "dynamic-lake-paimon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["vortex"]
+vortex = ["paimon/vortex"]
+
+[dependencies]
+async-trait.workspace = true
+datafusion.workspace = true
+dynamic-lake-core = { path = "../dynamic-lake-core" }
+dynamic-lake-format = { path = "../dynamic-lake-format" }
+paimon = { path = "../../third-party/paimon-rust/crates/paimon", default-features = false, features = ["storage-fs", "storage-memory"] }
+paimon-datafusion = { path = "../../third-party/paimon-rust/crates/integrations/datafusion" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio.workspace = true
+
+[lints]
+workspace = true

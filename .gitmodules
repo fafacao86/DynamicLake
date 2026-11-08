@@ -1,0 +1,8 @@
+[submodule "third-party/paimon-rust"]
+	path = third-party/paimon-rust
+	url = https://github.com/apache/paimon-rust.git
+	branch = main
+[submodule "third-party/vortex"]
+	path = third-party/vortex
+	url = https://github.com/vortex-data/vortex.git
+	branch = develop

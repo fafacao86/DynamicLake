@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dynamic-lake-core",
+    "crates/dynamic-lake-format",
+    "crates/dynamic-lake-metastore-redb",
+    "crates/dynamic-lake-datafusion",
+    "crates/dynamic-lake-client",
+    "crates/dynamic-lake-paimon",
+]
+default-members = [
+    "crates/dynamic-lake-core",
+    "crates/dynamic-lake-format",
+    "crates/dynamic-lake-metastore-redb",
+    "crates/dynamic-lake-datafusion",
+    "crates/dynamic-lake-client",
+    "crates/dynamic-lake-paimon",
+]
+exclude = [
+    "third-party/paimon-rust",
+    "third-party/vortex",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+
+# Keep these aligned with third-party/paimon-rust/Cargo.toml. Paimon is the
+# compatibility owner for the first DataFusion execution backend.
+[workspace.dependencies]
+arrow = "58.0"
+async-trait = "0.1"
+datafusion = "54.0.0"
+futures = "0.3"
+object_store = "0.13.2"
+sha1 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1.39.2", features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

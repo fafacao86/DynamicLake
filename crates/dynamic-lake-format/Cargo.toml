@@ -1,0 +1,17 @@
+[package]
+name = "dynamic-lake-format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+datafusion.workspace = true
+dynamic-lake-core = { path = "../dynamic-lake-core" }
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+

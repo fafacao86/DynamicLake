@@ -1,0 +1,18 @@
+[package]
+name = "dynamic-lake-metastore-redb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+dynamic-lake-core = { path = "../dynamic-lake-core" }
+redb = "4.4.0"
+
+[dev-dependencies]
+tempfile = "3"
+tokio.workspace = true
+
+[lints]
+workspace = true
