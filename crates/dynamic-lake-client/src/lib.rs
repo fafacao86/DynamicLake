@@ -4,10 +4,13 @@
 //! refresh scopes are derived internally.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::TableReference;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_plan::collect;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::ObjectName;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
@@ -20,12 +23,18 @@ use dynamic_lake_core::{
 use dynamic_lake_datafusion::{
     DataFusionPipelinePlan, DataFusionPlanOptimizer, compile_pipeline_plan,
     ivm::{
-        IvmNormalizer, IvmRefreshContext, IvmRewriter, normalize::register_ivm_functions,
+        IvmNormalizer, IvmPlanSignatureGenerator, IvmRefreshContext, IvmRewriter,
+        normalize::{
+            materialized_view_delta_plan, materialized_view_plan, materialized_view_schema,
+            register_ivm_functions, row_id_columns,
+        },
         physical::install_lake_scans,
     },
 };
 pub use dynamic_lake_format;
-use dynamic_lake_format::LakeFormatRegistry;
+use dynamic_lake_format::{
+    CreateDatabaseRequest, CreateTableRequest, LakeFormatRegistry, LakeTable,
+};
 
 #[derive(Clone)]
 pub struct PipelineClient {
@@ -71,6 +80,76 @@ impl PipelineClient {
             .map_err(|error| PipelineError::Execution(error.to_string()))
     }
 
+    pub async fn query_sql(&self, sql: &str) -> PipelineResult<Vec<RecordBatch>> {
+        self.session
+            .sql(sql)
+            .await
+            .map_err(|error| PipelineError::Execution(error.to_string()))?
+            .collect()
+            .await
+            .map_err(|error| PipelineError::Execution(error.to_string()))
+    }
+
+    async fn execute_plan(&self, plan: &LogicalPlan) -> PipelineResult<Vec<RecordBatch>> {
+        let execution = self
+            .session
+            .state()
+            .create_physical_plan(plan)
+            .await
+            .map_err(|error| PipelineError::Execution(error.to_string()))?;
+        collect(execution, self.session.task_ctx())
+            .await
+            .map_err(|error| PipelineError::Execution(error.to_string()))
+    }
+
+    pub async fn create_database(
+        &self,
+        catalog: &str,
+        request: CreateDatabaseRequest,
+    ) -> PipelineResult<()> {
+        self.formats
+            .create_database(catalog, request)
+            .await
+            .map_err(|error| PipelineError::Catalog(error.to_string()))
+    }
+
+    pub async fn create_table(
+        &self,
+        request: CreateTableRequest,
+    ) -> PipelineResult<Arc<dyn LakeTable>> {
+        self.formats
+            .create_table(request)
+            .await
+            .map_err(|error| PipelineError::Catalog(error.to_string()))
+    }
+
+    pub async fn latest_version(&self, table: &TableIdentifier) -> PipelineResult<i64> {
+        self.formats
+            .get_table(table)
+            .await
+            .map_err(|error| PipelineError::Catalog(error.to_string()))?
+            .latest_version()
+            .ok_or_else(|| PipelineError::Catalog(format!("table `{table}` has no snapshot")))
+    }
+
+    pub async fn append_batches(
+        &self,
+        table: &TableIdentifier,
+        batches: Vec<RecordBatch>,
+    ) -> PipelineResult<()> {
+        self.formats
+            .append_batches(&self.session, table, batches)
+            .await
+            .map_err(|error| PipelineError::Execution(error.to_string()))
+    }
+
+    pub async fn register_table_snapshot(&self, table: &TableIdentifier) -> PipelineResult<()> {
+        self.formats
+            .register_table_snapshot(&self.session, table)
+            .await
+            .map_err(|error| PipelineError::Catalog(error.to_string()))
+    }
+
     pub fn materialized_view(
         &self,
         name: impl Into<String>,
@@ -83,6 +162,14 @@ impl PipelineClient {
         .materialized_view(name, query)
     }
 
+    pub async fn materialized_view_sql(
+        &self,
+        name: impl Into<String>,
+        sql: &str,
+    ) -> PipelineResult<MaterializedViewBuilder> {
+        self.materialized_view(name, self.plan_sql(sql).await?)
+    }
+
     pub fn compile(
         &self,
         definitions: &MaterializedViewGraph,
@@ -90,26 +177,102 @@ impl PipelineClient {
         compile_pipeline_plan(definitions.graph())
     }
 
-    pub async fn plan_incremental(
+    async fn create_materialized_view_tables(
+        &self,
+        definitions: &MaterializedViewGraph,
+    ) -> PipelineResult<()> {
+        for view in definitions.graph().topological_order() {
+            let node = definitions.graph().node(view).ok_or_else(|| {
+                PipelineError::Invalid(format!("materialized view `{view}` is not defined"))
+            })?;
+            let catalog = view.parts().first().ok_or_else(|| {
+                PipelineError::Invalid(format!("materialized view `{view}` has no catalog"))
+            })?;
+            let format = self.formats.catalog(catalog).ok_or_else(|| {
+                PipelineError::Catalog(format!("no lake format registered for catalog `{catalog}`"))
+            })?;
+            format
+                .create_materialized_view_table(view.clone(), materialized_view_schema(&node.query))
+                .await
+                .map_err(|error| PipelineError::Catalog(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub async fn trigger_incremental_refresh(
         &self,
         definitions: &MaterializedViewGraph,
         view: &TableIdentifier,
+        expected_signature: &str,
+        refresh: IvmRefreshContext,
+    ) -> PipelineResult<Option<Vec<RecordBatch>>> {
+        match self
+            .plan_incremental(definitions, view, expected_signature, refresh)
+            .await?
+        {
+            Some(plan) => {
+                let expected_snapshot = self.latest_version(view).await?;
+                let batches = self.execute_plan(&plan).await?;
+                self.formats
+                    .write_changes(&self.session, view, batches.clone(), expected_snapshot)
+                    .await
+                    .map_err(|error| PipelineError::Execution(error.to_string()))?;
+                Ok(Some(batches))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Recompute one view and persist its current snapshot.
+    pub async fn trigger_full_refresh(
+        &self,
+        definitions: &MaterializedViewGraph,
+        view: &TableIdentifier,
+    ) -> PipelineResult<()> {
+        let node = definitions.graph().node(view).ok_or_else(|| {
+            PipelineError::Invalid(format!("materialized view `{view}` is not defined"))
+        })?;
+        let plan = materialized_view_plan(node.query.clone())
+            .map_err(|error| PipelineError::Invalid(error.to_string()))?;
+        let batches = self.execute_plan(&plan).await?;
+        self.formats
+            .overwrite_batches(&self.session, view, batches)
+            .await
+            .map_err(|error| PipelineError::Execution(error.to_string()))
+    }
+
+    async fn plan_incremental(
+        &self,
+        definitions: &MaterializedViewGraph,
+        view: &TableIdentifier,
+        expected_signature: &str,
         refresh: IvmRefreshContext,
     ) -> PipelineResult<Option<LogicalPlan>> {
         let node = definitions.graph().node(view).ok_or_else(|| {
             PipelineError::Invalid(format!("materialized view `{view}` is not defined"))
         })?;
+        let current_signature = IvmPlanSignatureGenerator.generate(&node.query);
+        if current_signature.sha256 != expected_signature {
+            return Err(PipelineError::Invalid(format!(
+                "IVM plan signature changed for `{view}`: expected {expected_signature}, current {}; full refresh required",
+                current_signature.sha256
+            )));
+        }
         let rewriter = IvmRewriter::new(&node.query, refresh)
             .map_err(|error| PipelineError::Invalid(error.to_string()))?;
         let plan = rewriter
             .rewrite_outer_join_primary(&node.query)
             .map_err(|error| PipelineError::Invalid(error.to_string()))?;
         match plan {
-            Some(plan) => Ok(Some(
-                dynamic_lake_datafusion::ivm::materialize_ctes(&self.session, plan)
+            Some(plan) => {
+                let plan = dynamic_lake_datafusion::ivm::materialize_ctes(&self.session, plan)
                     .await
-                    .map_err(|error| PipelineError::Execution(error.to_string()))?,
-            )),
+                    .map_err(|error| PipelineError::Execution(error.to_string()))?;
+                let plan =
+                    materialized_view_delta_plan(plan, row_id_columns(node.query.schema()).len())
+                        .map_err(|error| PipelineError::Invalid(error.to_string()))?;
+                Ok(Some(plan))
+            }
             None => Ok(None),
         }
     }
@@ -121,6 +284,14 @@ pub struct MaterializedViewBuilder {
 }
 
 impl MaterializedViewBuilder {
+    /// Build definitions and create their managed storage tables.
+    pub async fn create(self) -> PipelineResult<MaterializedViewGraph> {
+        let client = self.client.clone();
+        let definitions = self.build()?;
+        client.create_materialized_view_tables(&definitions).await?;
+        Ok(definitions)
+    }
+
     /// Add a persisted dynamic table from an already analyzed DataFusion plan.
     ///
     /// Every materialized view is IVM-normalized when it is added. Whether a
@@ -159,6 +330,15 @@ impl MaterializedViewBuilder {
                 "duplicate dynamic table name".to_string(),
             ));
         }
+        let plan_signatures = drafts
+            .iter()
+            .map(|draft| {
+                (
+                    draft.id.clone(),
+                    IvmPlanSignatureGenerator.generate(&draft.query).sha256,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let mut nodes = BTreeMap::new();
         for draft in drafts {
             let mut upstream = BTreeSet::new();
@@ -192,17 +372,24 @@ impl MaterializedViewBuilder {
         }
         Ok(MaterializedViewGraph {
             graph: PipelineGraph::try_new(nodes)?,
+            plan_signatures,
         })
     }
 }
 
 pub struct MaterializedViewGraph {
     graph: PipelineGraph,
+    plan_signatures: BTreeMap<TableIdentifier, String>,
 }
 
 impl MaterializedViewGraph {
     pub fn graph(&self) -> &PipelineGraph {
         &self.graph
+    }
+
+    /// Persist this digest with the materialized view's initial output.
+    pub fn plan_signature(&self, view: &TableIdentifier) -> Option<&str> {
+        self.plan_signatures.get(view).map(String::as_str)
     }
 
     pub fn into_graph(self) -> PipelineGraph {
@@ -303,7 +490,7 @@ mod tests {
 
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::empty::EmptyTable;
-    use dynamic_lake_core::GraphOperations;
+    use dynamic_lake_core::{GraphOperations, IncrementInterval};
     use dynamic_lake_datafusion::ivm::ROW_ID_COLUMN;
 
     use super::*;
@@ -389,6 +576,7 @@ mod tests {
             .graph()
             .node(&joined)
             .expect("normalized dynamic table");
+        assert!(definitions.plan_signature(&joined).is_some());
         let row_id_count = definition
             .query
             .schema()
@@ -403,6 +591,34 @@ mod tests {
                 .values()
                 .all(|stream| stream.mv_node_id == joined)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incremental_plan_rejects_mismatched_signature()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let session = SessionContext::new();
+        session.register_table(
+            "source",
+            Arc::new(EmptyTable::new(Arc::new(Schema::new(vec![
+                Field::new(ROW_ID_COLUMN, DataType::Int64, false),
+                Field::new("value", DataType::Int64, false),
+            ])))),
+        )?;
+        let client = PipelineClient::new(session);
+        let query = client.plan_sql("SELECT value FROM source").await?;
+        let definitions = client.materialized_view("mv", query)?.build()?;
+        let view: TableIdentifier = "paimon.default.mv".parse()?;
+        let source: TableIdentifier = "paimon.default.source".parse()?;
+        let refresh = IvmRefreshContext::new(
+            source.clone(),
+            BTreeMap::from([(source, IncrementInterval::try_new(1, 2)?)]),
+        )?;
+        let error = client
+            .plan_incremental(&definitions, &view, "wrong-signature", refresh)
+            .await
+            .expect_err("signature mismatch must reject incremental refresh");
+        assert!(error.to_string().contains("full refresh required"));
         Ok(())
     }
 }

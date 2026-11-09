@@ -57,9 +57,11 @@ impl<'a> OjvSecondaryDeltaPlanner<'a> {
     /// Apply the primary delta to the old view to obtain V1, the intermediate
     /// view used to compute the secondary delta.
     ///
+    /// ```text
     ///     V0 -------------------- LEFT ANTI D- ---+
     ///                                            UNION ALL ---> V1
     ///     D+ ------------------------------------+
+    /// ```
     ///
     /// D- removes old primary rows; D+ adds new primary rows. Both
     /// ceased_orphans and new_orphans use V1 to identify orphan changes.

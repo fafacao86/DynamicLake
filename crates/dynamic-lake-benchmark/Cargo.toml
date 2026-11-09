@@ -15,6 +15,7 @@ dynamic-lake-paimon = { path = "../dynamic-lake-paimon" }
 paimon = { path = "../../third-party/paimon-rust/crates/paimon", default-features = false, features = ["storage-fs", "storage-memory"] }
 tempfile = "3"
 tokio.workspace = true
+tpchgen = "3.0.0"
 
 [lints]
 workspace = true

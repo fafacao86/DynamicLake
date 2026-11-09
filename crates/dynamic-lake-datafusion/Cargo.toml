@@ -12,6 +12,7 @@ dynamic-lake-core = { path = "../dynamic-lake-core" }
 dynamic-lake-format = { path = "../dynamic-lake-format" }
 futures.workspace = true
 sha1.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

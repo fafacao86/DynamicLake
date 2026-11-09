@@ -5,8 +5,9 @@ pub mod row_id;
 
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::logical_expr::logical_plan::{Aggregate, Join, Projection, TableScan, Union};
-use datafusion::logical_expr::{Expr, JoinType, LogicalPlan};
+use datafusion::logical_expr::{Expr, ExprSchemable, JoinType, LogicalPlan};
 
 use crate::ivm::error::IvmError;
 
@@ -220,6 +221,100 @@ impl IvmNormalizer {
 
 pub fn normalize_ivm_plan(plan: LogicalPlan) -> Result<NormalizedIvmPlan, IvmError> {
     IvmNormalizer::default().normalize(plan)
+}
+
+/// Build the persisted schema of a normalized IVM view.
+pub fn materialized_view_schema(plan: &LogicalPlan) -> SchemaRef {
+    let source_row_ids = plan
+        .schema()
+        .fields()
+        .iter()
+        .filter(|field| field.name() == ROW_ID_COLUMN)
+        .count();
+    if source_row_ids <= 1 {
+        return Arc::new(plan.schema().as_arrow().clone());
+    }
+    let mut input = 0;
+    let mut fields = plan
+        .schema()
+        .as_arrow()
+        .fields()
+        .iter()
+        .map(|field| {
+            if field.name() == ROW_ID_COLUMN {
+                let renamed = field
+                    .as_ref()
+                    .clone()
+                    .with_name(format!("__ivm_input_{input}_row_id"));
+                input += 1;
+                renamed
+            } else {
+                field.as_ref().clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    fields.push(Field::new(ROW_ID_COLUMN, DataType::Utf8, false));
+    Arc::new(Schema::new(fields))
+}
+
+/// Add a stable output identity and expose each input identity for an OJV.
+pub fn materialized_view_plan(plan: LogicalPlan) -> Result<LogicalPlan, IvmError> {
+    let row_ids = row_id_columns(plan.schema());
+    if row_ids.len() <= 1 {
+        return Ok(plan);
+    }
+    let mut exprs = plan
+        .schema()
+        .columns()
+        .into_iter()
+        .filter(|column| column.name != ROW_ID_COLUMN)
+        .map(Expr::Column)
+        .collect::<Vec<_>>();
+    for (index, column) in row_ids.iter().enumerate() {
+        exprs.push(Expr::Column(column.clone()).alias(format!("__ivm_input_{index}_row_id")));
+    }
+    exprs.push(
+        ivm_sha1_expr(RowIdDomain::Join, row_ids.into_iter().map(Expr::Column))
+            .cast_to(&DataType::Utf8, plan.schema())?
+            .alias(ROW_ID_COLUMN),
+    );
+    Ok(LogicalPlan::Projection(Projection::try_new(
+        exprs,
+        Arc::new(plan),
+    )?))
+}
+
+/// OJV deltas carry input identities; derive the persisted join identity.
+pub fn materialized_view_delta_plan(
+    plan: LogicalPlan,
+    input_count: usize,
+) -> Result<LogicalPlan, IvmError> {
+    if plan
+        .schema()
+        .has_column_with_unqualified_name(ROW_ID_COLUMN)
+    {
+        return Ok(plan);
+    }
+    let columns = plan.schema().columns();
+    let mut identities = Vec::with_capacity(input_count);
+    for index in 0..input_count {
+        let name = format!("__ivm_input_{index}_row_id");
+        let column = columns
+            .iter()
+            .find(|column| column.name == name)
+            .ok_or_else(|| IvmError::UnsupportedOperator(format!("delta is missing `{name}`")))?;
+        identities.push(Expr::Column(column.clone()));
+    }
+    let mut exprs = columns.into_iter().map(Expr::Column).collect::<Vec<_>>();
+    exprs.push(
+        ivm_sha1_expr(RowIdDomain::Join, identities)
+            .cast_to(&DataType::Utf8, plan.schema())?
+            .alias(ROW_ID_COLUMN),
+    );
+    Ok(LogicalPlan::Projection(Projection::try_new(
+        exprs,
+        Arc::new(plan),
+    )?))
 }
 
 #[cfg(test)]

@@ -8,6 +8,8 @@ use crate::ivm::error::IvmError;
 
 use super::ForwardJoinKeyGraph;
 
+/// Input leaf number assigned left-to-right across one OJV analysis.
+/// It remains attached to that input during rewrite, but is not persistent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OjvInputId(usize);
 
@@ -31,7 +33,7 @@ pub fn input_row_id_name(input: OjvInputId) -> String {
     format!("__ivm_input_{}_row_id", input.get())
 }
 
-/// A stable input of one maximal OJV multi-join.
+/// One input leaf of a maximal OJV multi-join.
 ///
 /// Every input plan is expected to expose the normalized row-id column by
 /// [`crate::ivm::ROW_ID_COLUMN`]; no per-input column handle is stored.

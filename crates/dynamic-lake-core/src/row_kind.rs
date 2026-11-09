@@ -11,3 +11,5 @@ impl RowKind {
         self as i32
     }
 }
+/// Hidden column carrying the sign of an IVM output row.
+pub const IVM_ROW_KIND_COLUMN: &str = "__ivm_row_kind";

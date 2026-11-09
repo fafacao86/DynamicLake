@@ -26,6 +26,11 @@ impl MetastoreRepository {
     ) -> MetastoreResult<()> {
         let mut transaction = self.store.begin().await?;
         let result = async {
+            if definition.plan_signature.is_empty() {
+                return Err(MetastoreError::Encoding(
+                    "materialized view plan signature must not be empty".to_string(),
+                ));
+            }
             for stream in streams {
                 validate_stream(definition, stream)?;
             }
@@ -102,6 +107,18 @@ impl MetastoreRepository {
         let definition_value = encode(definition)?;
         let mut transaction = self.store.begin().await?;
         let result = async {
+            let stored = transaction.get(&definition_key).await?.ok_or_else(|| {
+                MetastoreError::Encoding("materialized view definition does not exist".to_string())
+            })?;
+            let previous: MaterializedViewDefinition = decode(&stored)?;
+            if previous.plan_signature.is_empty()
+                || previous.plan_signature != definition.plan_signature
+            {
+                return Err(MetastoreError::Encoding(format!(
+                    "IVM plan signature changed for `{}`; full refresh required",
+                    definition.node_id
+                )));
+            }
             transaction.put(definition_key, definition_value).await?;
             for stream in streams {
                 let key = stream_object_key(&definition.node_id, &stream.name)?;

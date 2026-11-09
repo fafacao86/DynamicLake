@@ -22,7 +22,7 @@ pub(super) async fn plan_changes(
     let audit = AuditLogTable::new(table);
     let plan = audit
         .new_incremental_scan(
-            IncrementalScanMode::Auto,
+            IncrementalScanMode::Delta,
             interval.before_exclusive,
             interval.after_inclusive,
         )

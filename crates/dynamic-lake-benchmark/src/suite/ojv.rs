@@ -6,25 +6,25 @@ use std::time::Instant;
 use datafusion::arrow::array::{Array, Int32Array, Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
-use datafusion::physical_plan::collect;
 use datafusion::prelude::SessionContext;
 use dynamic_lake_client::PipelineClient;
-use dynamic_lake_core::{IncrementInterval, IvmStreamObject, RowKind, TableIdentifier};
-use dynamic_lake_datafusion::ivm::{IvmRefreshContext, normalize::ROW_KIND_COLUMN};
-use dynamic_lake_format::{
-    CreateDatabaseRequest, CreateTableRequest, LakeFormat, LakeFormatRegistry,
+use dynamic_lake_core::{
+    GraphOperations, IncrementInterval, IvmStreamObject, RowKind, TableIdentifier,
 };
-use dynamic_lake_paimon::PaimonFormat;
+use dynamic_lake_datafusion::ivm::{IvmRefreshContext, normalize::ROW_KIND_COLUMN};
+use dynamic_lake_format::{CreateDatabaseRequest, CreateTableRequest, LakeFormatRegistry};
+use dynamic_lake_paimon::{PaimonFormat, table_options};
 use paimon::Options;
 
-use crate::tools::{register_snapshot_table, version, write_rows};
+use crate::tools::{tpch_dataset::tpch_dataset, write_rows};
+
+const OJV_SQL: &str = include_str!("../../sql/ojv.sql");
+const DOWNSTREAM_SQL: &str = include_str!("../../sql/ojv_downstream.sql");
 
 type Rows = BTreeMap<(i64, Option<i64>), i64>;
 
 pub async fn run(row_count: i64, change_count: usize) -> Result<(), Box<dyn Error>> {
-    if row_count < 1 || change_count > ((row_count + 1) / 2) as usize {
-        return Err("expected rows > 0 and changes <= number of odd rows".into());
-    }
+    let dataset = tpch_dataset(row_count, change_count)?;
 
     let warehouse = tempfile::tempdir()?;
     let mut options = Options::new();
@@ -40,32 +40,42 @@ pub async fn run(row_count: i64, change_count: usize) -> Result<(), Box<dyn Erro
     session.register_catalog("paimon", catalog);
     let client = PipelineClient::new(session).with_formats(registry);
 
-    LakeFormat::catalog(format.as_ref())
-        .create_database(CreateDatabaseRequest {
-            database: "analytics".to_string(),
-            properties: Vec::new(),
-            if_not_exists: false,
-        })
+    client
+        .create_database(
+            "paimon",
+            CreateDatabaseRequest {
+                database: "analytics".to_string(),
+                properties: Vec::new(),
+                if_not_exists: false,
+            },
+        )
         .await?;
     let a_schema = Arc::new(Schema::new(vec![
         Field::new("__ivm_row_id", DataType::Int64, false),
-        Field::new("id", DataType::Int64, false),
+        Field::new("customer_key", DataType::Int64, false),
     ]));
     let b_schema = Arc::new(Schema::new(vec![
         Field::new("__ivm_row_id", DataType::Int64, false),
-        Field::new("a_id", DataType::Int64, false),
+        Field::new("order_customer_key", DataType::Int64, false),
     ]));
     for name in ["a", "b"] {
         let table: TableIdentifier = format!("paimon.analytics.{name}").parse()?;
-        LakeFormat::catalog(format.as_ref())
+        client
             .create_table(CreateTableRequest {
                 table,
                 schema: Arc::clone(if name == "a" { &a_schema } else { &b_schema }),
                 partition_by: Vec::new(),
                 primary_key: vec!["__ivm_row_id".to_string()],
                 properties: vec![
-                    ("bucket".to_string(), "1".to_string()),
-                    ("bucket-key".to_string(), "__ivm_row_id".to_string()),
+                    (table_options::BUCKET.to_string(), "1".to_string()),
+                    (
+                        table_options::BUCKET_KEY.to_string(),
+                        "__ivm_row_id".to_string(),
+                    ),
+                    (
+                        table_options::FILE_FORMAT.to_string(),
+                        "parquet".to_string(),
+                    ),
                 ],
                 comment: None,
                 ignore_if_exists: false,
@@ -75,41 +85,56 @@ pub async fn run(row_count: i64, change_count: usize) -> Result<(), Box<dyn Erro
 
     let a: TableIdentifier = "paimon.analytics.a".parse()?;
     let b: TableIdentifier = "paimon.analytics.b".parse()?;
-    write_rows(&client, format.as_ref(), &a, 1..=row_count, &a_schema).await?;
-    write_rows(
-        &client,
-        format.as_ref(),
-        &b,
-        (1..=row_count).filter(|id| id % 2 == 0),
-        &b_schema,
-    )
-    .await?;
-    register_snapshot_table(&client, format.as_ref(), &a, &a_schema).await?;
-    register_snapshot_table(&client, format.as_ref(), &b, &b_schema).await?;
+    write_rows(&client, &a, dataset.customers, &a_schema).await?;
+    write_rows(&client, &b, dataset.initial_orders, &b_schema).await?;
+    client.register_table_snapshot(&a).await?;
+    client.register_table_snapshot(&b).await?;
 
-    let sql = "SELECT paimon.analytics.a.id AS id, paimon.analytics.b.a_id AS b_id \
-               FROM paimon.analytics.a LEFT JOIN paimon.analytics.b \
-               ON paimon.analytics.a.id = paimon.analytics.b.a_id";
     let view: TableIdentifier = "paimon.analytics.mv".parse()?;
     let definitions = client
-        .materialized_view(view.to_string(), client.plan_sql(sql).await?)?
-        .build()?;
-    let compiled = client.compile(&definitions)?;
-    assert!(compiled.node(&view).is_some());
+        .materialized_view_sql(view.to_string(), OJV_SQL)
+        .await?
+        .create()
+        .await?;
+    client.trigger_full_refresh(&definitions, &view).await?;
+    client.register_table_snapshot(&view).await?;
 
-    let before = visible_rows(client.session().sql(sql).await?.collect().await?)?;
-    let a_version = version(format.as_ref(), &a).await?;
-    let before_b_version = version(format.as_ref(), &b).await?;
+    let downstream: TableIdentifier = "paimon.analytics.mv_downstream".parse()?;
+    let downstream_definitions = client
+        .materialized_view_sql(downstream.to_string(), DOWNSTREAM_SQL)
+        .await?
+        .create()
+        .await?;
+    client
+        .trigger_full_refresh(&downstream_definitions, &downstream)
+        .await?;
+    let chain = client
+        .materialized_view(view.to_string(), client.plan_sql(OJV_SQL).await?)?
+        .materialized_view(
+            downstream.to_string(),
+            client.plan_sql(DOWNSTREAM_SQL).await?,
+        )?
+        .build()?;
+    assert!(
+        chain
+            .graph()
+            .node(&downstream)
+            .ok_or("missing downstream MV")?
+            .upstream
+            .contains(&view),
+        "MV dependency graph is missing the upstream MV"
+    );
+    let downstream_before = visible_rows(client.query_sql(DOWNSTREAM_SQL).await?)?;
+    let before_mv_version = client.latest_version(&view).await?;
+    let mv_stream =
+        IvmStreamObject::create(downstream.clone(), view.clone(), Some(before_mv_version));
+
+    let before = visible_rows(client.query_sql(OJV_SQL).await?)?;
+    let a_version = client.latest_version(&a).await?;
+    let before_b_version = client.latest_version(&b).await?;
     let b_stream = IvmStreamObject::create(view.clone(), b.clone(), Some(before_b_version));
-    write_rows(
-        &client,
-        format.as_ref(),
-        &b,
-        (1..=row_count).filter(|id| id % 2 == 1).take(change_count),
-        &b_schema,
-    )
-    .await?;
-    let after_b_version = version(format.as_ref(), &b).await?;
+    write_rows(&client, &b, dataset.new_orders, &b_schema).await?;
+    let after_b_version = client.latest_version(&b).await?;
     let b_interval = b_stream
         .pending_interval(after_b_version)?
         .ok_or("expected a changed source")?;
@@ -117,26 +142,27 @@ pub async fn run(row_count: i64, change_count: usize) -> Result<(), Box<dyn Erro
     let refresh = IvmRefreshContext::new(
         b.clone(),
         BTreeMap::from([
-            (a, IncrementInterval::try_new(a_version, a_version)?),
+            (a.clone(), IncrementInterval::try_new(a_version, a_version)?),
             (b.clone(), b_interval),
         ]),
     )?;
     let started = Instant::now();
-    let delta = client
-        .plan_incremental(&definitions, &view, refresh)
+    let delta_batches = client
+        .trigger_incremental_refresh(
+            &chain,
+            &view,
+            chain
+                .plan_signature(&view)
+                .ok_or("missing plan signature")?,
+            refresh,
+        )
         .await?
-        .ok_or("expected an incremental plan")?;
-    let execution = client
-        .session()
-        .state()
-        .create_physical_plan(&delta)
-        .await?;
-    let delta_batches = collect(execution, client.session().task_ctx()).await?;
+        .ok_or("expected incremental changes")?;
     let incremental_time = started.elapsed();
 
     let started = Instant::now();
-    register_snapshot_table(&client, format.as_ref(), &b, &b_schema).await?;
-    let recomputed = visible_rows(client.session().sql(sql).await?.collect().await?)?;
+    client.register_table_snapshot(&b).await?;
+    let recomputed = visible_rows(client.query_sql(OJV_SQL).await?)?;
     let full_time = started.elapsed();
     let mut maintained = before;
     let delta_rows = apply_delta(&mut maintained, &delta_batches)?;
@@ -144,8 +170,60 @@ pub async fn run(row_count: i64, change_count: usize) -> Result<(), Box<dyn Erro
         maintained, recomputed,
         "incremental result differs from full recompute"
     );
+    let after_mv_version = client.latest_version(&view).await?;
+    let mv_interval = mv_stream
+        .pending_interval(after_mv_version)?
+        .ok_or("expected a changed upstream MV")?;
+    let downstream_refresh = IvmRefreshContext::new(
+        view.clone(),
+        BTreeMap::from([
+            (a.clone(), IncrementInterval::try_new(a_version, a_version)?),
+            (view.clone(), mv_interval),
+        ]),
+    )?;
+    let started = Instant::now();
+    let downstream_delta = client
+        .trigger_incremental_refresh(
+            &chain,
+            &downstream,
+            chain
+                .plan_signature(&downstream)
+                .ok_or("missing downstream plan signature")?,
+            downstream_refresh,
+        )
+        .await?
+        .ok_or("expected downstream incremental changes")?;
+    let downstream_time = started.elapsed();
+    client.register_table_snapshot(&view).await?;
+    let persisted_upstream = visible_rows(
+        client
+            .query_sql("SELECT id, b_id FROM paimon.analytics.mv")
+            .await?,
+    )?;
+    assert_eq!(
+        persisted_upstream, recomputed,
+        "persisted upstream MV differs from full recompute"
+    );
+    let downstream_recomputed = visible_rows(client.query_sql(DOWNSTREAM_SQL).await?)?;
+    let mut downstream_maintained = downstream_before;
+    let downstream_delta_rows = apply_delta(&mut downstream_maintained, &downstream_delta)?;
+    assert!(downstream_delta_rows > 0, "MV-on-MV produced no changes");
+    assert_eq!(
+        downstream_maintained, downstream_recomputed,
+        "MV-on-MV incremental result differs from full recompute"
+    );
+    client.register_table_snapshot(&downstream).await?;
+    let persisted_downstream = visible_rows(
+        client
+            .query_sql("SELECT id, b_id FROM paimon.analytics.mv_downstream")
+            .await?,
+    )?;
+    assert_eq!(
+        persisted_downstream, downstream_recomputed,
+        "persisted downstream MV differs from full recompute"
+    );
     println!(
-        "rows={row_count} changes={change_count} delta_rows={delta_rows} incremental={incremental_time:?} full={full_time:?} result_rows={}",
+        "rows={row_count} changes={change_count} delta_rows={delta_rows} incremental={incremental_time:?} full={full_time:?} downstream_delta_rows={downstream_delta_rows} downstream={downstream_time:?} result_rows={}",
         recomputed.values().sum::<i64>()
     );
     Ok(())

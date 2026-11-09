@@ -5,10 +5,10 @@ use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::logical_plan::{Filter, Sort, Union};
 use datafusion::logical_expr::{Expr, LogicalPlan, SortExpr, lit};
 
-use crate::ivm::cte_utils::cte_ref;
 use crate::ivm::error::IvmError;
 use crate::ivm::normalize::{DeltaRowKind, ROW_KIND_COLUMN};
 use crate::ivm::ojv::{OjvInputId, OjvSecondaryDeltaPlanner, PrimaryDeltaPlanner};
+use crate::ivm::plan_utils::cte_ref;
 use crate::ivm::plan_utils::project_plan;
 
 use super::super::IvmDeltaRewriter;

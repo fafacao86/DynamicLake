@@ -5,7 +5,7 @@ pub use dynamic_lake_core::RowKind as DeltaRowKind;
 use crate::ivm::error::IvmError;
 
 pub const ROW_ID_COLUMN: &str = "__ivm_row_id";
-pub const ROW_KIND_COLUMN: &str = "__ivm_row_kind";
+pub use dynamic_lake_core::IVM_ROW_KIND_COLUMN as ROW_KIND_COLUMN;
 
 /// Domain separation for deterministic row-id hashing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

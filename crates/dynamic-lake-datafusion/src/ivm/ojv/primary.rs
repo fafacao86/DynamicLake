@@ -67,11 +67,13 @@ impl PrimaryDeltaPlanner {
 /// commute LEFT/RIGHT, then simplify the join type. If the left child contains
 /// the delta, only the simplification is needed.
 ///
+/// ```text
 ///     Before:             J(p)             After:       simplify(commute(J))(p)
 ///                        /    \                         /                 \
 ///                       L    Delta                    Delta                L
 ///
 ///     ON:             (L.k, Delta.k)                 (Delta.k, L.k)
+/// ```
 fn rewrite_tree(
     tree: &OjvJoinTree,
     changed_input: OjvInputId,
@@ -155,10 +157,12 @@ fn commute(join_type: JoinType) -> Result<JoinType, IvmError> {
 /// The main path keeps only rows derived from the delta. Remove join branches
 /// that preserve old rows from the right side alone.
 ///
+/// ```text
 ///     Delta RIGHT old  -> Delta INNER old
 ///     Delta FULL  old  -> Delta LEFT  old
 ///     Delta LEFT  old  -> Delta LEFT  old
 ///     Delta INNER old  -> Delta INNER old
+/// ```
 fn simplify(join_type: JoinType) -> Result<JoinType, IvmError> {
     match join_type {
         JoinType::Inner => Ok(JoinType::Inner),
@@ -171,6 +175,7 @@ fn simplify(join_type: JoinType) -> Result<JoinType, IvmError> {
 
 /// Walk up the main path from the delta, flattening each bushy right subtree.
 ///
+/// ```text
 ///     Before:         J3                 After:           J4
 ///                    /  \                                /  \
 ///                   J2   J4                             J3   R4
@@ -178,6 +183,7 @@ fn simplify(join_type: JoinType) -> Result<JoinType, IvmError> {
 ///             Delta R2 R3 R4                          J2   R3
 ///                                                    /  \
 ///                                                 Delta R2
+/// ```
 ///
 /// Process the left path through J2 first, then rotate the right-side J4
 /// above J3.
@@ -206,18 +212,22 @@ fn left_deepen_main_path(plan: LogicalPlan) -> Result<LogicalPlan, IvmError> {
 /// the original right branch, swap the bushy join's children and ON keys and
 /// commute LEFT/RIGHT before performing the rotation below.
 ///
+/// ```text
 ///     Before:          main(p12)            After:         lifted(p23)
 ///                     /         \                         /          \
 ///                main_path     bushy(p23)             main(p12)       far
 ///                             /        \              /       \
 ///                           near       far        main_path   near
+/// ```
 ///
-///     p12 joins main_path with near; p23 joins near with far.
+/// p12 joins main_path with near; p23 joins near with far.
 ///
 /// When main is LEFT, the resulting join types and compensation are:
 ///
+/// ```text
 ///     bushy FULL/LEFT  ->  (main_path LEFT near) LEFT far
 ///     bushy RIGHT/INNER -> DISTINCT(NULL_IF((main_path LEFT near) LEFT far))
+/// ```
 ///
 /// When main is INNER, the lifted join uses simplify(bushy_type).
 /// Near may itself be a join. Recursively process the rotated result until
@@ -329,6 +339,7 @@ fn rebuild_plan_join(
 /// of the original bushy subtree to NULL, then deduplicate by all output
 /// columns to collapse duplicate orphan rows introduced by the rotation.
 ///
+/// ```text
 ///     rotated rows
 ///         |
 ///         v
@@ -336,6 +347,7 @@ fn rebuild_plan_join(
 ///         |
 ///         v
 ///     DISTINCT(all output columns)
+/// ```
 fn null_if_and_distinct(
     plan: LogicalPlan,
     missing_far: Expr,

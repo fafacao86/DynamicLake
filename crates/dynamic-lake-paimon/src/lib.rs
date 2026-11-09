@@ -4,16 +4,25 @@
 //! to this crate through `LakeCatalog` and `LakeTablePlanner`.
 
 mod change_read;
+mod change_sink;
+pub mod table_options;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::catalog::Session;
+use datafusion::common::ScalarValue;
 use datafusion::datasource::TableProvider;
+use datafusion::datasource::sink::DataSinkExec;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use dynamic_lake_core::{PipelineCatalog, PipelineError, PipelineResult, TableIdentifier};
+use datafusion::physical_plan::expressions::{CaseExpr, Column, Literal};
+use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
+use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
+use dynamic_lake_core::{
+    IVM_ROW_KIND_COLUMN, PipelineCatalog, PipelineError, PipelineResult, RowKind, TableIdentifier,
+};
 use dynamic_lake_format::{
     AlterTableRequest, ChangeReadPlanRequest, CreateDatabaseRequest, CreateTableRequest,
     DropDatabaseRequest, DropTableRequest, FormatCapability, LakeCatalog, LakeFormat,
@@ -21,9 +30,11 @@ use dynamic_lake_format::{
     ReadPlanRequest, ScanAuthority, TableAlteration, WriteMode, WritePlan, WritePlanRequest,
 };
 use paimon::catalog::{Catalog, Identifier};
-use paimon::spec::{Schema, SchemaChange};
+use paimon::spec::{RowKind as PaimonRowKind, Schema, SchemaChange, VALUE_KIND_FIELD_NAME};
 use paimon::{Options, Table};
 use paimon_datafusion::{PaimonTableProvider, SQLContext};
+
+use crate::change_sink::PaimonChangeSink;
 
 const PAIMON_CAPABILITIES: &[FormatCapability] = &[
     FormatCapability::CreateTable,
@@ -68,6 +79,28 @@ impl PaimonFormat {
             .map_err(catalog_error)?;
         table_metadata(table, table_path).await
     }
+}
+
+/// Apply the Paimon settings required by a managed materialized view table.
+pub fn normalize_managed_table_options(properties: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut options = Options::from_map(properties.into_iter().collect());
+    for (key, value) in [
+        (table_options::WRITE_ONLY, false),
+        (table_options::COMMIT_FORCE_COMPACT, true),
+        (table_options::COMPACTION_FORCE_UP_LEVEL_0, true),
+        (table_options::WRITE_BUFFER_SPILLABLE, false),
+        (table_options::DELETION_VECTORS_ENABLED, true),
+        (table_options::LOOKUP_REMOTE_FILE_ENABLED, true),
+    ] {
+        options.set(key, value.to_string());
+    }
+    let mut options = options
+        .to_map()
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    options.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    options
 }
 
 impl LakeFormat for PaimonFormat {
@@ -160,6 +193,33 @@ impl LakeCatalog for PaimonFormat {
             .await
             .map_err(catalog_error)?;
         table_metadata(table, table_path).await
+    }
+
+    async fn create_materialized_view_table(
+        &self,
+        table: TableIdentifier,
+        schema: datafusion::arrow::datatypes::SchemaRef,
+    ) -> LakeFormatResult<Arc<dyn LakeTable>> {
+        self.create_table(CreateTableRequest {
+            table,
+            schema,
+            partition_by: Vec::new(),
+            primary_key: vec!["__ivm_row_id".to_string()],
+            properties: normalize_managed_table_options(vec![
+                (table_options::BUCKET.to_string(), "1".to_string()),
+                (
+                    table_options::BUCKET_KEY.to_string(),
+                    "__ivm_row_id".to_string(),
+                ),
+                (
+                    table_options::FILE_FORMAT.to_string(),
+                    "parquet".to_string(),
+                ),
+            ]),
+            comment: None,
+            ignore_if_exists: false,
+        })
+        .await
     }
 
     async fn alter_table(&self, request: AlterTableRequest) -> LakeFormatResult<()> {
@@ -301,18 +361,79 @@ impl LakeTablePlanner for PaimonFormat {
                 )));
             }
         }
-        let provider = PaimonTableProvider::try_new(table).map_err(planning_error)?;
-        let insert_op = match request.mode {
-            WriteMode::Append => InsertOp::Append,
-            WriteMode::Overwrite => InsertOp::Overwrite,
+        let input: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(request.input));
+        let execution = match request.mode {
+            WriteMode::Replace => {
+                let input = project_change_write(input, &table)?;
+                let schema = input.schema();
+                Arc::new(DataSinkExec::new(
+                    input,
+                    Arc::new(PaimonChangeSink::new(table, schema)),
+                    None,
+                )) as Arc<dyn ExecutionPlan>
+            }
+            WriteMode::Append | WriteMode::Overwrite => {
+                let provider = PaimonTableProvider::try_new(table).map_err(planning_error)?;
+                let op = if request.mode == WriteMode::Overwrite {
+                    InsertOp::Overwrite
+                } else {
+                    InsertOp::Append
+                };
+                provider.insert_into(session, input, op).await?
+            }
         };
-        let input = Arc::new(CoalescePartitionsExec::new(request.input));
-        let execution = provider.insert_into(session, input, insert_op).await?;
         Ok(WritePlan {
             execution,
             commit_authority: "paimon-table-commit".to_string(),
         })
     }
+}
+
+fn project_change_write(
+    input: Arc<dyn ExecutionPlan>,
+    table: &Table,
+) -> LakeFormatResult<Arc<dyn ExecutionPlan>> {
+    let schema = input.schema();
+    let table_schema =
+        paimon::arrow::build_read_arrow_schema(table.schema().fields()).map_err(planning_error)?;
+    let mut projections = table_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let index = schema.index_of(field.name()).map_err(planning_error)?;
+            Ok(ProjectionExpr {
+                expr: Arc::new(Column::new(field.name(), index)) as Arc<dyn PhysicalExpr>,
+                alias: field.name().to_string(),
+            })
+        })
+        .collect::<LakeFormatResult<Vec<_>>>()?;
+    let kind_index = schema
+        .index_of(IVM_ROW_KIND_COLUMN)
+        .map_err(planning_error)?;
+    let kind = Arc::new(Column::new(IVM_ROW_KIND_COLUMN, kind_index)) as Arc<dyn PhysicalExpr>;
+    let signed =
+        |value| Arc::new(Literal::new(ScalarValue::Int32(Some(value)))) as Arc<dyn PhysicalExpr>;
+    let native =
+        |value| Arc::new(Literal::new(ScalarValue::Int8(Some(value)))) as Arc<dyn PhysicalExpr>;
+    let kind = CaseExpr::try_new(
+        Some(kind),
+        vec![
+            (
+                signed(RowKind::Positive.code()),
+                native(PaimonRowKind::Insert.to_value()),
+            ),
+            (
+                signed(RowKind::Negative.code()),
+                native(PaimonRowKind::Delete.to_value()),
+            ),
+        ],
+        Some(native(i8::MAX)),
+    )?;
+    projections.push(ProjectionExpr {
+        expr: Arc::new(kind),
+        alias: VALUE_KIND_FIELD_NAME.to_string(),
+    });
+    Ok(Arc::new(ProjectionExec::try_new(projections, input)?))
 }
 
 #[derive(Clone)]
@@ -460,6 +581,31 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 
     use super::*;
+
+    #[test]
+    fn managed_options_force_dv_and_l0_compaction() -> LakeFormatResult<()> {
+        let options = normalize_managed_table_options(vec![
+            (table_options::BUCKET.into(), "1".into()),
+            (
+                table_options::DELETION_VECTORS_ENABLED.into(),
+                "false".into(),
+            ),
+        ])
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+        for (key, expected) in [
+            (table_options::BUCKET, "1"),
+            (table_options::DELETION_VECTORS_ENABLED, "true"),
+            (table_options::COMMIT_FORCE_COMPACT, "true"),
+            (table_options::COMPACTION_FORCE_UP_LEVEL_0, "true"),
+            (table_options::WRITE_ONLY, "false"),
+            (table_options::WRITE_BUFFER_SPILLABLE, "false"),
+            (table_options::LOOKUP_REMOTE_FILE_ENABLED, "true"),
+        ] {
+            assert_eq!(options.get(key).map(String::as_str), Some(expected));
+        }
+        Ok(())
+    }
 
     #[test]
     fn accepts_qualified_paimon_identifiers() -> LakeFormatResult<()> {

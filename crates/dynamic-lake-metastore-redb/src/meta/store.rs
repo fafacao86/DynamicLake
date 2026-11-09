@@ -78,6 +78,21 @@ mod tests {
             vec![stream.clone()]
         );
         let advanced = stream.advanced_to(4).expect("advance cursor");
+        let mut incompatible = definition.clone();
+        incompatible.plan_signature = "different-layout".to_string();
+        assert!(
+            repository
+                .save_refresh_metadata(&incompatible, std::slice::from_ref(&advanced))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            repository
+                .list_stream_objects(&node_id)
+                .await
+                .expect("load unchanged stream"),
+            vec![stream.clone()]
+        );
         repository
             .save_refresh_metadata(&definition, std::slice::from_ref(&advanced))
             .await

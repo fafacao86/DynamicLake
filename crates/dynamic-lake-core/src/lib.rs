@@ -24,5 +24,5 @@ pub use refresh::{
     NodeRefreshMode, PipelineCatalog, RefreshMode, RefreshPlan, RefreshPlanner, RefreshReason,
     RefreshRequest, RefreshStep,
 };
-pub use row_kind::RowKind;
+pub use row_kind::{IVM_ROW_KIND_COLUMN, RowKind};
 pub use service::PipelineService;

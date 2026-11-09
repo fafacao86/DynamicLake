@@ -2,12 +2,18 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::TableReference;
+use datafusion::datasource::MemTable;
+use datafusion::physical_plan::collect;
+use datafusion::prelude::SessionContext;
 use dynamic_lake_core::{PipelineCatalog, PipelineError, PipelineResult, TableIdentifier};
 
 use crate::{
     AlterTableRequest, CreateDatabaseRequest, CreateTableRequest, DropDatabaseRequest,
     DropTableRequest, LakeCatalog, LakeFormat, LakeFormatError, LakeFormatResult, LakeTable,
-    LakeTablePlanner,
+    LakeTablePlanner, ReadPlanRequest, WriteMode, WritePlanRequest,
 };
 
 /// Immutable format registry used by planner and execution services.
@@ -84,6 +90,146 @@ impl LakeFormatRegistry {
     ) -> LakeFormatResult<Arc<dyn LakeTable>> {
         let format = self.resolve_table(&request.table)?;
         format.catalog().create_table(request).await
+    }
+
+    pub async fn append_batches(
+        &self,
+        session: &SessionContext,
+        table: &TableIdentifier,
+        batches: Vec<RecordBatch>,
+    ) -> LakeFormatResult<()> {
+        self.write_batches(session, table, batches, WriteMode::Append, None)
+            .await
+    }
+
+    pub async fn overwrite_batches(
+        &self,
+        session: &SessionContext,
+        table: &TableIdentifier,
+        batches: Vec<RecordBatch>,
+    ) -> LakeFormatResult<()> {
+        self.write_batches(session, table, batches, WriteMode::Overwrite, None)
+            .await
+    }
+
+    pub async fn write_changes(
+        &self,
+        session: &SessionContext,
+        table: &TableIdentifier,
+        batches: Vec<RecordBatch>,
+        expected_snapshot: i64,
+    ) -> LakeFormatResult<()> {
+        self.write_batches(
+            session,
+            table,
+            batches,
+            WriteMode::Replace,
+            Some(expected_snapshot),
+        )
+        .await
+    }
+
+    async fn write_batches(
+        &self,
+        session: &SessionContext,
+        table: &TableIdentifier,
+        batches: Vec<RecordBatch>,
+        mode: WriteMode,
+        expected_snapshot: Option<i64>,
+    ) -> LakeFormatResult<()> {
+        let format = self.resolve_table(table)?;
+        let expected_snapshot = match expected_snapshot {
+            Some(version) => Some(version),
+            None => format
+                .catalog()
+                .get_table(table)
+                .await?
+                .latest_version()
+                .or(Some(-1)),
+        };
+        let input = session
+            .read_batches(batches)?
+            .create_physical_plan()
+            .await?;
+        let write = format
+            .planner()
+            .plan_write(
+                &session.state(),
+                WritePlanRequest {
+                    table: table.clone(),
+                    input,
+                    mode,
+                    expected_snapshot,
+                },
+            )
+            .await?;
+        collect(write.execution, session.task_ctx()).await?;
+        Ok(())
+    }
+
+    pub async fn register_table_snapshot(
+        &self,
+        session: &SessionContext,
+        table: &TableIdentifier,
+    ) -> LakeFormatResult<()> {
+        let [catalog, database, name] = table.parts() else {
+            return Err(LakeFormatError::InvalidRequest(format!(
+                "table `{table}` must have catalog, database and table names"
+            )));
+        };
+        let format = self.resolve_table(table)?;
+        let native_schema = format.catalog().get_table(table).await?.schema().clone();
+        let schema = Arc::new(Schema::new(
+            native_schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    if field.name() == "__ivm_row_id" {
+                        Arc::new(field.as_ref().clone().with_nullable(false))
+                    } else {
+                        Arc::clone(field)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let read = format
+            .planner()
+            .plan_read(
+                &session.state(),
+                ReadPlanRequest {
+                    table: table.clone(),
+                    snapshot: None,
+                    projection: None,
+                    filters: Vec::new(),
+                    limit: None,
+                },
+            )
+            .await?;
+        let batches = collect(read.execution, session.task_ctx())
+            .await?
+            .into_iter()
+            .map(|batch| {
+                let columns = batch
+                    .columns()
+                    .iter()
+                    .zip(schema.fields())
+                    .map(|(column, field)| {
+                        if column.data_type() == field.data_type() {
+                            Ok(Arc::clone(column))
+                        } else {
+                            datafusion::arrow::compute::cast(column, field.data_type())
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                RecordBatch::try_new(schema.clone(), columns)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(datafusion::error::DataFusionError::from)?;
+        let provider = Arc::new(MemTable::try_new(schema, vec![batches])?);
+        let reference = TableReference::full(catalog.clone(), database.clone(), name.clone());
+        let _ = session.deregister_table(reference.clone());
+        session.register_table(reference, provider)?;
+        Ok(())
     }
 
     pub async fn alter_table(&self, request: AlterTableRequest) -> LakeFormatResult<()> {

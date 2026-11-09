@@ -112,6 +112,17 @@ pub trait LakeCatalog: Send + Sync {
         request: CreateTableRequest,
     ) -> super::LakeFormatResult<std::sync::Arc<dyn LakeTable>>;
 
+    /// Create storage for an IVM-managed materialized view.
+    async fn create_materialized_view_table(
+        &self,
+        _table: TableIdentifier,
+        _schema: SchemaRef,
+    ) -> super::LakeFormatResult<std::sync::Arc<dyn LakeTable>> {
+        Err(super::LakeFormatError::Unsupported(
+            "materialized view table creation".to_string(),
+        ))
+    }
+
     async fn alter_table(&self, request: AlterTableRequest) -> super::LakeFormatResult<()>;
 
     async fn drop_table(&self, request: DropTableRequest) -> super::LakeFormatResult<()>;
