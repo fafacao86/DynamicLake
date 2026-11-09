@@ -14,11 +14,15 @@ use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Token;
 use dynamic_lake_core::{
-    DynamicTable, IvmStreamObject, PipelineBuildOptions, PipelineError, PipelineGraph,
-    PipelineResult, TableIdentifier,
+    DynamicTable, GraphOperations, IvmStreamObject, PipelineBuildOptions, PipelineError,
+    PipelineGraph, PipelineResult, TableIdentifier,
 };
 use dynamic_lake_datafusion::{
-    DataFusionPipelinePlan, DataFusionPlanOptimizer, compile_pipeline_plan, ivm::IvmNormalizer,
+    DataFusionPipelinePlan, DataFusionPlanOptimizer, compile_pipeline_plan,
+    ivm::{
+        IvmNormalizer, IvmRefreshContext, IvmRewriter, normalize::register_ivm_functions,
+        physical::install_lake_scans,
+    },
 };
 pub use dynamic_lake_format;
 use dynamic_lake_format::LakeFormatRegistry;
@@ -32,6 +36,7 @@ pub struct PipelineClient {
 
 impl PipelineClient {
     pub fn new(session: SessionContext) -> Self {
+        register_ivm_functions(&session);
         Self {
             session,
             build_options: PipelineBuildOptions::default(),
@@ -45,6 +50,7 @@ impl PipelineClient {
     }
 
     pub fn with_formats(mut self, formats: LakeFormatRegistry) -> Self {
+        self.session = install_lake_scans(self.session, formats.clone());
         self.formats = formats;
         self
     }
@@ -82,6 +88,30 @@ impl PipelineClient {
         definitions: &MaterializedViewGraph,
     ) -> PipelineResult<DataFusionPipelinePlan> {
         compile_pipeline_plan(definitions.graph())
+    }
+
+    pub async fn plan_incremental(
+        &self,
+        definitions: &MaterializedViewGraph,
+        view: &TableIdentifier,
+        refresh: IvmRefreshContext,
+    ) -> PipelineResult<Option<LogicalPlan>> {
+        let node = definitions.graph().node(view).ok_or_else(|| {
+            PipelineError::Invalid(format!("materialized view `{view}` is not defined"))
+        })?;
+        let rewriter = IvmRewriter::new(&node.query, refresh)
+            .map_err(|error| PipelineError::Invalid(error.to_string()))?;
+        let plan = rewriter
+            .rewrite_outer_join_primary(&node.query)
+            .map_err(|error| PipelineError::Invalid(error.to_string()))?;
+        match plan {
+            Some(plan) => Ok(Some(
+                dynamic_lake_datafusion::ivm::materialize_ctes(&self.session, plan)
+                    .await
+                    .map_err(|error| PipelineError::Execution(error.to_string()))?,
+            )),
+            None => Ok(None),
+        }
     }
 }
 

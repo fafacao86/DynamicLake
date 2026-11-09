@@ -3,6 +3,8 @@
 //! DAG and refresh code never imports Paimon types. The format registry talks
 //! to this crate through `LakeCatalog` and `LakeTablePlanner`.
 
+mod change_read;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -13,10 +15,10 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use dynamic_lake_core::{PipelineCatalog, PipelineError, PipelineResult, TableIdentifier};
 use dynamic_lake_format::{
-    AlterTableRequest, CreateDatabaseRequest, CreateTableRequest, DropDatabaseRequest,
-    DropTableRequest, FormatCapability, LakeCatalog, LakeFormat, LakeFormatError, LakeFormatKind,
-    LakeFormatResult, LakeTable, LakeTablePlanner, ReadPlan, ReadPlanRequest, ScanAuthority,
-    TableAlteration, WriteMode, WritePlan, WritePlanRequest,
+    AlterTableRequest, ChangeReadPlanRequest, CreateDatabaseRequest, CreateTableRequest,
+    DropDatabaseRequest, DropTableRequest, FormatCapability, LakeCatalog, LakeFormat,
+    LakeFormatError, LakeFormatKind, LakeFormatResult, LakeTable, LakeTablePlanner, ReadPlan,
+    ReadPlanRequest, ScanAuthority, TableAlteration, WriteMode, WritePlan, WritePlanRequest,
 };
 use paimon::catalog::{Catalog, Identifier};
 use paimon::spec::{Schema, SchemaChange};
@@ -258,6 +260,20 @@ impl LakeTablePlanner for PaimonFormat {
             snapshot_version,
             scan_authority: ScanAuthority::Client,
         })
+    }
+
+    async fn plan_changes(
+        &self,
+        _session: &dyn Session,
+        request: ChangeReadPlanRequest,
+    ) -> LakeFormatResult<ReadPlan> {
+        let identifier = paimon_identifier(request.table.parts())?;
+        let table = self
+            .catalog
+            .get_table(&identifier)
+            .await
+            .map_err(catalog_error)?;
+        change_read::plan_changes(table, request.interval).await
     }
 
     async fn plan_write(

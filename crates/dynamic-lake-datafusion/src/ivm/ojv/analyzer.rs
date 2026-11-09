@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::logical_expr::{Expr, LogicalPlan, Operator};
+use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, Operator};
 
 use crate::ivm::error::IvmError;
 
@@ -71,6 +71,9 @@ impl AnalyzerState {
             return Ok((OjvJoinTree::Input(id), vec![id]));
         };
 
+        if join.join_type != JoinType::Left {
+            return Err(IvmError::UnsupportedJoinType(join.join_type));
+        }
         if join.null_aware {
             return Err(IvmError::UnsupportedOperator(
                 "null-aware OJV join".to_string(),
@@ -82,7 +85,7 @@ impl AnalyzerState {
         for (left_expr, right_expr) in &join.on {
             let left_bound = self.sources_of(left_expr, &left_sources, inputs)?;
             let right_bound = self.sources_of(right_expr, &right_sources, inputs)?;
-            join_keys.extend(OjvJoinKeyBinding::for_join(
+            join_keys.push(OjvJoinKeyBinding::for_join(
                 left_bound,
                 right_bound,
                 join.join_type,
@@ -126,7 +129,7 @@ impl AnalyzerState {
         expr: &Expr,
         candidates: &[OjvInputId],
         inputs: &BTreeMap<OjvInputId, OjvJoinInput>,
-    ) -> Result<Vec<OjvInputId>, IvmError> {
+    ) -> Result<OjvInputId, IvmError> {
         let mut columns = Vec::new();
         expr.apply(&mut |expr: &Expr| {
             if let Expr::Column(column) = expr {
@@ -134,7 +137,6 @@ impl AnalyzerState {
             }
             Ok(TreeNodeRecursion::Continue)
         })?;
-        let columns = columns;
         let sources = candidates
             .iter()
             .copied()
@@ -145,12 +147,15 @@ impl AnalyzerState {
                     .any(|column| input.plan.schema().has_column(column))
             })
             .collect::<Vec<_>>();
-        if sources.is_empty() {
-            return Err(IvmError::UnsupportedOperator(format!(
+        match sources.as_slice() {
+            [source] => Ok(*source),
+            [] => Err(IvmError::UnsupportedOperator(format!(
                 "join key does not reference a collected input: {expr}"
-            )));
+            ))),
+            _ => Err(IvmError::UnsupportedOperator(format!(
+                "join key references multiple collected inputs: {expr}"
+            ))),
         }
-        Ok(sources)
     }
 
     fn collect_filter_bindings(
@@ -184,7 +189,7 @@ impl AnalyzerState {
             Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
                 let left_bound = self.sources_of(&binary.left, left_sources, inputs)?;
                 let right_bound = self.sources_of(&binary.right, right_sources, inputs)?;
-                join_keys.extend(OjvJoinKeyBinding::for_join(
+                join_keys.push(OjvJoinKeyBinding::for_join(
                     left_bound,
                     right_bound,
                     join_type,
@@ -253,6 +258,42 @@ mod tests {
                 .reachable_from(OjvInputId::new(1))?,
             BTreeSet::from([OjvInputId::new(1), OjvInputId::new(2)])
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_non_left_joins() -> Result<(), Box<dyn std::error::Error>> {
+        let session = SessionContext::new();
+        for (name, key) in [("a", "a_id"), ("b", "b_id")] {
+            session.register_table(
+                name,
+                Arc::new(EmptyTable::new(Arc::new(Schema::new(vec![
+                    Field::new(ROW_ID_COLUMN, DataType::Int64, false),
+                    Field::new(key, DataType::Int64, false),
+                ])))),
+            )?;
+        }
+        for (sql, join_type) in [
+            (
+                "SELECT a_id, b_id FROM a INNER JOIN b ON a_id = b_id",
+                JoinType::Inner,
+            ),
+            (
+                "SELECT a_id, b_id FROM a RIGHT JOIN b ON a_id = b_id",
+                JoinType::Right,
+            ),
+            (
+                "SELECT a_id, b_id FROM a FULL JOIN b ON a_id = b_id",
+                JoinType::Full,
+            ),
+        ] {
+            let plan = session.state().create_logical_plan(sql).await?;
+            let normalized = IvmNormalizer::default().normalize(plan)?;
+            assert!(matches!(
+                OjvAnalyzer.analyze(&normalized.plan),
+                Err(IvmError::UnsupportedJoinType(rejected)) if rejected == join_type
+            ));
+        }
         Ok(())
     }
 }

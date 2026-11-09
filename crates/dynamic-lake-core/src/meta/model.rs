@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
 use crate::{NodeId, TableName};
@@ -30,19 +28,6 @@ impl IncrementInterval {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StreamIntervals {
-    pub node_id: NodeId,
-    #[serde(with = "table_interval_map")]
-    pub intervals: BTreeMap<TableName, IncrementInterval>,
-}
-
-impl StreamIntervals {
-    pub fn new(node_id: NodeId, intervals: BTreeMap<TableName, IncrementInterval>) -> Self {
-        Self { node_id, intervals }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum StreamStatus {
     #[default]
@@ -57,21 +42,43 @@ pub struct IvmStreamObject {
     pub name: String,
     pub mv_node_id: NodeId,
     pub source: TableName,
-    pub initial_version: Option<i64>,
-    pub consumed_version: Option<i64>,
+    #[serde(alias = "consumed_version")]
+    pub last_version: Option<i64>,
     pub status: StreamStatus,
 }
 
 impl IvmStreamObject {
-    pub fn create(mv_node_id: NodeId, source: TableName, initial_version: Option<i64>) -> Self {
+    pub fn create(mv_node_id: NodeId, source: TableName, last_version: Option<i64>) -> Self {
         Self {
             name: default_stream_name(&mv_node_id, &source),
             mv_node_id,
             source,
-            initial_version,
-            consumed_version: initial_version,
+            last_version,
             status: StreamStatus::Active,
         }
+    }
+
+    /// Plan against a fixed source snapshot without advancing the durable cursor.
+    pub fn pending_interval(
+        &self,
+        latest_version: i64,
+    ) -> MetastoreResult<Option<IncrementInterval>> {
+        let consumed = self.last_version.ok_or_else(|| {
+            MetastoreError::Encoding(format!(
+                "stream `{}` has no consumed version; initialize it with a full refresh",
+                self.name
+            ))
+        })?;
+        let interval = IncrementInterval::try_new(consumed, latest_version)?;
+        Ok(interval.has_changes().then_some(interval))
+    }
+
+    /// Return an updated cursor for persistence after the view output commits.
+    pub fn advanced_to(&self, version: i64) -> MetastoreResult<Self> {
+        self.pending_interval(version)?;
+        let mut advanced = self.clone();
+        advanced.last_version = Some(version);
+        Ok(advanced)
     }
 }
 
@@ -94,32 +101,25 @@ fn default_stream_name(node_id: &NodeId, source: &TableName) -> String {
     format!("__dynamic_lake_ivm_stream_{hash:016x}")
 }
 
-mod table_interval_map {
-    use std::collections::BTreeMap;
+#[cfg(test)]
+mod tests {
+    use super::IvmStreamObject;
 
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    use crate::TableName;
-
-    use super::IncrementInterval;
-
-    pub fn serialize<S>(
-        intervals: &BTreeMap<TableName, IncrementInterval>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        intervals.iter().collect::<Vec<_>>().serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D>(
-        deserializer: D,
-    ) -> Result<BTreeMap<TableName, IncrementInterval>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Vec::<(TableName, IncrementInterval)>::deserialize(deserializer)
-            .map(|intervals| intervals.into_iter().collect())
+    #[test]
+    fn stream_interval_uses_consumed_version_without_advancing_it() {
+        let stream = IvmStreamObject::create(
+            "paimon.analytics.mv".parse().unwrap(),
+            "paimon.analytics.source".parse().unwrap(),
+            Some(3),
+        );
+        assert_eq!(stream.pending_interval(3).unwrap(), None);
+        let interval = stream.pending_interval(5).unwrap().unwrap();
+        assert_eq!(
+            (interval.before_exclusive, interval.after_inclusive),
+            (3, 5)
+        );
+        assert_eq!(stream.last_version, Some(3));
+        assert_eq!(stream.advanced_to(5).unwrap().last_version, Some(5));
+        assert!(stream.pending_interval(2).is_err());
     }
 }

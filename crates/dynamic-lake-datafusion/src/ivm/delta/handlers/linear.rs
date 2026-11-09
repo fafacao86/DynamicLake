@@ -5,14 +5,14 @@ use datafusion::common::Column;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::logical_expr::logical_plan::{Filter, Projection, TableScan};
 use datafusion::logical_expr::{Expr, LogicalPlan};
-use dynamic_lake_core::TableIdentifier;
 
 use crate::ivm::error::IvmError;
 use crate::ivm::normalize::ROW_ID_COLUMN;
+use crate::ivm::plan_utils::{resolve_column, table_identifier};
 
 use super::super::IvmDeltaRewriter;
-use super::super::scan::IvmDeltaScanNode;
-use super::super::scope::{is_changed_table, reference_parts};
+use super::super::scan::IvmScanNode;
+use super::super::scope::is_changed_table;
 
 pub(crate) struct LinearDeltaHandler;
 
@@ -22,20 +22,17 @@ impl LinearDeltaHandler {
         scan: &TableScan,
         rewriter: &IvmDeltaRewriter<'_>,
     ) -> Result<Option<LogicalPlan>, IvmError> {
-        if !is_changed_table(&scan.table_name, rewriter.context().refresh.changed_table()) {
+        let refresh = rewriter.context().refresh;
+        if !is_changed_table(&scan.table_name, refresh.changed_table()) {
             return Ok(None);
         }
         let table = table_identifier(&scan.table_name)?;
-        let interval = rewriter
-            .context()
-            .refresh
-            .interval_for(&table)
-            .ok_or(IvmError::MissingDelta)?;
+        let interval = refresh.interval_for(&table).ok_or(IvmError::MissingDelta)?;
         if !interval.has_changes() {
             return Ok(None);
         }
         Ok(Some(
-            IvmDeltaScanNode::new(scan.clone(), interval)?.into_plan(),
+            IvmScanNode::delta(scan.clone(), interval)?.into_plan(),
         ))
     }
 
@@ -101,34 +98,13 @@ fn remap_columns(expr: Expr, child: &LogicalPlan) -> Result<Expr, IvmError> {
             let Expr::Column(column) = expr else {
                 return Ok(Transformed::no(expr));
             };
-            Ok(Transformed::yes(Expr::Column(resolve_column(
-                child, &column,
-            )?)))
+            Ok(Transformed::yes(Expr::Column(
+                resolve_column(child, &column).ok_or_else(|| {
+                    datafusion::error::DataFusionError::Plan(format!(
+                        "delta projection cannot resolve column `{column}`"
+                    ))
+                })?,
+            )))
         })
         .map(|transformed| transformed.data)?)
-}
-
-fn resolve_column(plan: &LogicalPlan, column: &Column) -> datafusion::error::Result<Column> {
-    if plan.schema().has_column(column) {
-        return Ok(column.clone());
-    }
-    let columns = plan
-        .schema()
-        .iter()
-        .filter(|(_, field)| field.name() == &column.name)
-        .map(|(qualifier, field)| Column::new(qualifier.cloned(), field.name()))
-        .collect::<Vec<_>>();
-    match columns.as_slice() {
-        [column] => Ok(column.clone()),
-        _ => Err(datafusion::error::DataFusionError::Plan(format!(
-            "delta projection cannot resolve column `{column}`"
-        ))),
-    }
-}
-
-fn table_identifier(
-    reference: &datafusion::common::TableReference,
-) -> datafusion::error::Result<TableIdentifier> {
-    TableIdentifier::try_new(reference_parts(reference))
-        .map_err(|error| datafusion::error::DataFusionError::Plan(error.to_string()))
 }

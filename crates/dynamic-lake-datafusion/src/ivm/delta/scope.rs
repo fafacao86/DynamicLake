@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use datafusion::common::TableReference;
 use datafusion::logical_expr::LogicalPlan;
 
+use crate::ivm::plan_utils::reference_parts;
+
 use super::IvmRefreshContext;
 
 /// Per-refresh cache of subtrees that contain the changed base table.
@@ -60,18 +62,4 @@ pub(super) fn is_changed_table(
         .iter()
         .zip(changed_suffix)
         .all(|(reference, changed)| reference.eq_ignore_ascii_case(changed))
-}
-
-pub(super) fn reference_parts(reference: &TableReference) -> Vec<String> {
-    match reference {
-        TableReference::Bare { table } => vec![table.to_string()],
-        TableReference::Partial { schema, table } => {
-            vec![schema.to_string(), table.to_string()]
-        }
-        TableReference::Full {
-            catalog,
-            schema,
-            table,
-        } => vec![catalog.to_string(), schema.to_string(), table.to_string()],
-    }
 }

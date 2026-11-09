@@ -19,8 +19,8 @@ pub use catalog::{
 };
 pub use error::{LakeFormatError, LakeFormatResult};
 pub use planner::{
-    LakeTablePlanner, ReadPlan, ReadPlanRequest, ScanAuthority, WriteMode, WritePlan,
-    WritePlanRequest,
+    CHANGE_KIND_COLUMN, ChangeReadPlanRequest, LakeTablePlanner, ReadPlan, ReadPlanRequest,
+    ScanAuthority, WriteMode, WritePlan, WritePlanRequest,
 };
 pub use registry::LakeFormatRegistry;
 

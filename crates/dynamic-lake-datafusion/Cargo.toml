@@ -9,6 +9,8 @@ license.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
 dynamic-lake-core = { path = "../dynamic-lake-core" }
+dynamic-lake-format = { path = "../dynamic-lake-format" }
+futures.workspace = true
 sha1.workspace = true
 thiserror.workspace = true
 

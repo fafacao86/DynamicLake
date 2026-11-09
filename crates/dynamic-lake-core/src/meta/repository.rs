@@ -1,14 +1,11 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::NodeId;
 
-use super::key::{
-    mv_definition_key, stream_intervals_key, stream_object_key, stream_objects_prefix,
-};
+use super::key::{mv_definition_key, stream_object_key, stream_objects_prefix};
 use super::{
-    IncrementInterval, IvmStreamObject, KvTransaction, MaterializedViewDefinition, MetastoreError,
-    MetastoreResult, StreamIntervals, TransactionalKvStore,
+    IvmStreamObject, KvTransaction, MaterializedViewDefinition, MetastoreError, MetastoreResult,
+    TransactionalKvStore,
 };
 
 #[derive(Clone)]
@@ -21,8 +18,7 @@ impl MetastoreRepository {
         Self { store }
     }
 
-    /// Create the MV definition, stream objects, and initial stream offsets in
-    /// one transaction.
+    /// Create the MV definition and its stream cursors in one transaction.
     pub async fn create_materialized_view(
         &self,
         definition: &MaterializedViewDefinition,
@@ -37,42 +33,14 @@ impl MetastoreRepository {
             let definition_value = encode(definition)?;
             transaction.put(definition_key, definition_value).await?;
 
-            let mut intervals = BTreeMap::new();
             for stream in streams {
                 let stream_key = stream_object_key(&definition.node_id, &stream.name)?;
                 transaction.put(stream_key, encode(stream)?).await?;
-                if let Some(version) = stream.consumed_version {
-                    intervals.insert(
-                        stream.source.clone(),
-                        IncrementInterval::try_new(version, version)?,
-                    );
-                }
             }
-            let intervals = StreamIntervals::new(definition.node_id.clone(), intervals);
-            transaction
-                .put(
-                    stream_intervals_key(&definition.node_id)?,
-                    encode(&intervals)?,
-                )
-                .await
+            Ok(())
         }
         .await;
         finish_or_rollback(transaction, result).await
-    }
-
-    pub async fn save_stream_intervals(&self, intervals: &StreamIntervals) -> MetastoreResult<()> {
-        let key = stream_intervals_key(&intervals.node_id)?;
-        let value = encode(intervals)?;
-        let mut transaction = self.store.begin().await?;
-        let result = transaction.put(key, value).await;
-        finish_or_rollback(transaction, result).await
-    }
-
-    pub async fn load_stream_intervals(
-        &self,
-        node_id: &NodeId,
-    ) -> MetastoreResult<Option<StreamIntervals>> {
-        self.load(stream_intervals_key(node_id)?).await
     }
 
     pub async fn save_mv_definition(
@@ -120,25 +88,36 @@ impl MetastoreRepository {
         rows.into_iter().map(|(_, value)| decode(&value)).collect()
     }
 
-    /// Atomically persist the definition and the source intervals it consumed.
+    /// Persist the definition and advanced source cursors in one metadata transaction.
+    /// Call this only after the corresponding view output has committed.
     pub async fn save_refresh_metadata(
         &self,
         definition: &MaterializedViewDefinition,
-        intervals: &StreamIntervals,
+        streams: &[IvmStreamObject],
     ) -> MetastoreResult<()> {
-        if definition.node_id != intervals.node_id {
-            return Err(MetastoreError::Encoding(
-                "MV definition and stream intervals refer to different nodes".to_string(),
-            ));
+        for stream in streams {
+            validate_stream(definition, stream)?;
         }
         let definition_key = mv_definition_key(&definition.node_id)?;
         let definition_value = encode(definition)?;
-        let intervals_key = stream_intervals_key(&intervals.node_id)?;
-        let intervals_value = encode(intervals)?;
         let mut transaction = self.store.begin().await?;
         let result = async {
             transaction.put(definition_key, definition_value).await?;
-            transaction.put(intervals_key, intervals_value).await
+            for stream in streams {
+                let key = stream_object_key(&definition.node_id, &stream.name)?;
+                let existing = transaction.get(&key).await?.ok_or_else(|| {
+                    MetastoreError::Encoding(format!("stream `{}` does not exist", stream.name))
+                })?;
+                let previous: IvmStreamObject = decode(&existing)?;
+                if previous.source != stream.source || previous.last_version > stream.last_version {
+                    return Err(MetastoreError::Encoding(format!(
+                        "stream `{}` has an invalid cursor advance",
+                        stream.name
+                    )));
+                }
+                transaction.put(key, encode(stream)?).await?;
+            }
+            Ok(())
         }
         .await;
         finish_or_rollback(transaction, result).await

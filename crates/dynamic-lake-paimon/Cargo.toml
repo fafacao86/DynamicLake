@@ -14,6 +14,7 @@ async-trait.workspace = true
 datafusion.workspace = true
 dynamic-lake-core = { path = "../dynamic-lake-core" }
 dynamic-lake-format = { path = "../dynamic-lake-format" }
+futures.workspace = true
 paimon = { path = "../../third-party/paimon-rust/crates/paimon", default-features = false, features = ["storage-fs", "storage-memory"] }
 paimon-datafusion = { path = "../../third-party/paimon-rust/crates/integrations/datafusion" }
 thiserror.workspace = true

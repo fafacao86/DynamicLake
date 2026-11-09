@@ -4,4 +4,4 @@
 *.log
 *.tmp
 .env
-
+Cargo.lock

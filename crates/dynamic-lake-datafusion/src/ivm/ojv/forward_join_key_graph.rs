@@ -6,10 +6,12 @@ use super::{OjvInputId, OjvJoinKeyBinding, OjvMultiJoin};
 
 /// Forward dependency graph between OJV multi-join inputs.
 ///
-/// For a LEFT OUTER JOIN, changes propagate from the preserved left input to
-/// the null-producing right input. The graph is used by the secondary delta
-/// planner to determine which orphan terms may be affected by one base-table
-/// change.
+/// A LEFT join contributes an edge from its preserved input to its
+/// null-extended input. Other join types are rejected by the OJV analyzer.
+/// The secondary planner uses reachability to find affected orphan terms.
+///
+/// https://www.vldb.org/pvldb/vol18/p5153-zhou.pdf
+///
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardJoinKeyGraph {
     inputs: Vec<OjvInputId>,
@@ -36,22 +38,16 @@ impl ForwardJoinKeyGraph {
             .collect::<BTreeMap<_, _>>();
 
         for binding in bindings {
-            for left in &binding.left_inputs {
-                if !inputs.contains(left) {
-                    return Err(IvmError::MissingJoinInput(*left));
-                }
+            if !inputs.contains(&binding.left_input) {
+                return Err(IvmError::MissingJoinInput(binding.left_input));
             }
-            for right in &binding.right_inputs {
-                if !inputs.contains(right) {
-                    return Err(IvmError::MissingJoinInput(*right));
-                }
+            if !inputs.contains(&binding.right_input) {
+                return Err(IvmError::MissingJoinInput(binding.right_input));
             }
-            for left in binding.left_inputs {
-                let targets = successors
-                    .get_mut(&left)
-                    .expect("validated OJV input must exist");
-                targets.extend(binding.right_inputs.iter().copied());
-            }
+            successors
+                .get_mut(&binding.left_input)
+                .expect("validated OJV input must exist")
+                .insert(binding.right_input);
         }
 
         Ok(Self {
@@ -112,9 +108,9 @@ mod tests {
 
     #[test]
     fn left_join_edges_follow_preserved_to_null_side() {
-        let bindings = OjvJoinKeyBinding::for_join([id(0)], [id(1)], JoinType::Left)
+        let binding = OjvJoinKeyBinding::for_join(id(0), id(1), JoinType::Left)
             .expect("left join is supported");
-        let graph = ForwardJoinKeyGraph::try_new([id(0), id(1)], bindings).expect("valid graph");
+        let graph = ForwardJoinKeyGraph::try_new([id(0), id(1)], [binding]).expect("valid graph");
 
         assert_eq!(
             graph.successors(id(0)).expect("input 0"),
@@ -132,26 +128,10 @@ mod tests {
     }
 
     #[test]
-    fn inner_join_edges_are_bidirectional() {
-        let bindings = OjvJoinKeyBinding::for_join([id(0)], [id(1)], JoinType::Inner)
-            .expect("inner join is supported");
-        let graph = ForwardJoinKeyGraph::try_new([id(0), id(1)], bindings).expect("valid graph");
-
-        assert_eq!(
-            graph.successors(id(0)).expect("input 0"),
-            &BTreeSet::from([id(1)])
-        );
-        assert_eq!(
-            graph.successors(id(1)).expect("input 1"),
-            &BTreeSet::from([id(0)])
-        );
-    }
-
-    #[test]
-    fn computed_branch_can_contribute_multiple_sources() {
+    fn one_input_can_have_multiple_successors() {
         let bindings = vec![
-            OjvJoinKeyBinding::try_new([id(0)], [id(1), id(2)]).expect("binding"),
-            OjvJoinKeyBinding::try_new([id(1)], [id(2)]).expect("binding"),
+            OjvJoinKeyBinding::new(id(0), id(1)),
+            OjvJoinKeyBinding::new(id(0), id(2)),
         ];
         let graph =
             ForwardJoinKeyGraph::try_new([id(0), id(1), id(2)], bindings).expect("valid graph");
@@ -165,8 +145,8 @@ mod tests {
     #[test]
     fn reachable_from_terminates_when_graph_has_a_cycle() {
         let bindings = vec![
-            OjvJoinKeyBinding::try_new([id(0)], [id(1)]).expect("binding"),
-            OjvJoinKeyBinding::try_new([id(1)], [id(0)]).expect("binding"),
+            OjvJoinKeyBinding::new(id(0), id(1)),
+            OjvJoinKeyBinding::new(id(1), id(0)),
         ];
         let graph = ForwardJoinKeyGraph::try_new([id(0), id(1)], bindings).expect("valid graph");
 
@@ -177,20 +157,18 @@ mod tests {
     }
 
     #[test]
-    fn right_and_full_joins_are_rejected_for_now() {
-        assert!(matches!(
-            OjvJoinKeyBinding::for_join([id(0)], [id(1)], JoinType::Right),
-            Err(IvmError::UnsupportedJoinType(JoinType::Right))
-        ));
-        assert!(matches!(
-            OjvJoinKeyBinding::for_join([id(0)], [id(1)], JoinType::Full),
-            Err(IvmError::UnsupportedJoinType(JoinType::Full))
-        ));
+    fn non_left_join_bindings_are_rejected() {
+        for join_type in [JoinType::Inner, JoinType::Right, JoinType::Full] {
+            assert!(matches!(
+                OjvJoinKeyBinding::for_join(id(0), id(1), join_type),
+                Err(IvmError::UnsupportedJoinType(rejected)) if rejected == join_type
+            ));
+        }
     }
 
     #[test]
     fn graph_rejects_inputs_outside_the_multi_join() {
-        let binding = OjvJoinKeyBinding::try_new([id(0)], [id(9)]).expect("binding");
+        let binding = OjvJoinKeyBinding::new(id(0), id(9));
         assert!(matches!(
             ForwardJoinKeyGraph::try_new([id(0), id(1)], [binding]),
             Err(IvmError::MissingJoinInput(missing)) if missing == id(9)

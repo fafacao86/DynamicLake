@@ -6,10 +6,8 @@ use super::ojv::OjvInputId;
 
 #[derive(Debug, Error)]
 pub enum IvmError {
-    #[error("OJV join type `{0}` is not supported in the left-join incremental path")]
+    #[error("OJV join type `{0}` is not supported in the incremental path")]
     UnsupportedJoinType(JoinType),
-    #[error("OJV join-key binding must reference at least one input on both sides")]
-    EmptyJoinKeyBinding,
     #[error("OJV join-key binding references input `{0}` which is not part of the multi-join")]
     MissingJoinInput(OjvInputId),
     #[error("duplicate OJV input id `{0}`")]

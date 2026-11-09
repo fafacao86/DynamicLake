@@ -8,5 +8,5 @@ mod snapshot;
 pub use context::IvmRefreshContext;
 pub use dynamic_lake_core::IncrementInterval;
 pub use rewriter::{IvmDeltaRewriter, IvmRewriter};
-pub use scan::{IvmDeltaScanNode, IvmSnapshotScanNode};
+pub use scan::{IvmScanKind, IvmScanNode};
 pub use snapshot::IvmSnapshotPlanner;

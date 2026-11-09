@@ -6,10 +6,6 @@ pub fn mv_definition_key(node_id: &NodeId) -> MetastoreResult<Vec<u8>> {
     key(&["ivm", "mv", &node_id.to_string()])
 }
 
-pub fn stream_intervals_key(node_id: &NodeId) -> MetastoreResult<Vec<u8>> {
-    key(&["ivm", "stream-intervals", &node_id.to_string()])
-}
-
 pub fn stream_object_key(node_id: &NodeId, stream_name: &str) -> MetastoreResult<Vec<u8>> {
     key(&["ivm", "stream", &node_id.to_string(), stream_name])
 }

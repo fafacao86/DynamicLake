@@ -1,24 +1,11 @@
 use datafusion::common::{Column, DFSchema};
 use datafusion::logical_expr::LogicalPlan;
+pub use dynamic_lake_core::RowKind as DeltaRowKind;
 
 use crate::ivm::error::IvmError;
 
 pub const ROW_ID_COLUMN: &str = "__ivm_row_id";
 pub const ROW_KIND_COLUMN: &str = "__ivm_row_kind";
-pub const DML_FACTOR_COLUMN: &str = "__ivm_dml_factor";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
-pub enum DeltaRowKind {
-    Negative = -1,
-    Positive = 1,
-}
-
-impl DeltaRowKind {
-    pub const fn code(self) -> i32 {
-        self as i32
-    }
-}
 
 /// Domain separation for deterministic row-id hashing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

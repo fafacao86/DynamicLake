@@ -1,4 +1,6 @@
 //! Outer-join view (OJV) incremental maintenance.
+//!
+//! https://www.cs.columbia.edu/~jrzhou/pub/OJViewMaintenance.pdf
 
 mod analyzer;
 mod forward_join_key_graph;

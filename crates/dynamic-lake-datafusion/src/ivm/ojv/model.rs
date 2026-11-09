@@ -44,46 +44,29 @@ pub struct OjvJoinInput {
 /// One directional edge in the forward join-key graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OjvJoinKeyBinding {
-    pub left_inputs: Vec<OjvInputId>,
-    pub right_inputs: Vec<OjvInputId>,
+    pub left_input: OjvInputId,
+    pub right_input: OjvInputId,
 }
 
 impl OjvJoinKeyBinding {
-    pub fn try_new(
-        left_inputs: impl IntoIterator<Item = OjvInputId>,
-        right_inputs: impl IntoIterator<Item = OjvInputId>,
-    ) -> Result<Self, IvmError> {
-        let left_inputs = left_inputs.into_iter().collect::<Vec<_>>();
-        let right_inputs = right_inputs.into_iter().collect::<Vec<_>>();
-        if left_inputs.is_empty() || right_inputs.is_empty() {
-            return Err(IvmError::EmptyJoinKeyBinding);
+    pub fn new(left_input: OjvInputId, right_input: OjvInputId) -> Self {
+        Self {
+            left_input,
+            right_input,
         }
-        Ok(Self {
-            left_inputs,
-            right_inputs,
-        })
     }
 
     /// Build the directional bindings for the currently supported join shapes.
     ///
-    /// LEFT OUTER JOIN only propagates changes from its preserved left side to
-    /// its null-producing right side. INNER JOIN is retained because it is a
-    /// valid segment of the normalized OJV left-deep path.
+    /// LEFT joins propagate changes from their preserved input to the
+    /// null-extended input. Other join types are not supported yet.
     pub fn for_join(
-        left_inputs: impl IntoIterator<Item = OjvInputId>,
-        right_inputs: impl IntoIterator<Item = OjvInputId>,
+        left_input: OjvInputId,
+        right_input: OjvInputId,
         join_type: JoinType,
-    ) -> Result<Vec<Self>, IvmError> {
-        let left_to_right = Self::try_new(left_inputs, right_inputs)?;
+    ) -> Result<Self, IvmError> {
         match join_type {
-            JoinType::Left => Ok(vec![left_to_right]),
-            JoinType::Inner => {
-                let right_to_left = Self::try_new(
-                    left_to_right.right_inputs.clone(),
-                    left_to_right.left_inputs.clone(),
-                )?;
-                Ok(vec![left_to_right, right_to_left])
-            }
+            JoinType::Left => Ok(Self::new(left_input, right_input)),
             other => Err(IvmError::UnsupportedJoinType(other)),
         }
     }
@@ -133,13 +116,9 @@ impl OjvMultiJoin {
         }
         let join_keys = join_keys.into_iter().collect::<Vec<_>>();
         for binding in &join_keys {
-            for id in binding
-                .left_inputs
-                .iter()
-                .chain(binding.right_inputs.iter())
-            {
-                if !input_map.contains_key(id) {
-                    return Err(IvmError::MissingJoinInput(*id));
+            for id in [binding.left_input, binding.right_input] {
+                if !input_map.contains_key(&id) {
+                    return Err(IvmError::MissingJoinInput(id));
                 }
             }
         }

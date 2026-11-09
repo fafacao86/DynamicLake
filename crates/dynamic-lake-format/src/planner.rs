@@ -4,8 +4,11 @@ use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use dynamic_lake_core::TableIdentifier;
+use dynamic_lake_core::{IncrementInterval, TableIdentifier};
 use serde::{Deserialize, Serialize};
+
+/// Standard change kind emitted by [`LakeTablePlanner::plan_changes`].
+pub const CHANGE_KIND_COLUMN: &str = "__dl_change_kind";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ScanAuthority {
@@ -22,6 +25,12 @@ pub struct ReadPlanRequest {
     pub projection: Option<Vec<usize>>,
     pub filters: Vec<Expr>,
     pub limit: Option<usize>,
+}
+
+#[derive(Clone)]
+pub struct ChangeReadPlanRequest {
+    pub table: TableIdentifier,
+    pub interval: IncrementInterval,
 }
 
 #[derive(Clone)]
@@ -61,6 +70,22 @@ pub trait LakeTablePlanner: Send + Sync {
         session: &dyn Session,
         request: ReadPlanRequest,
     ) -> super::LakeFormatResult<ReadPlan>;
+
+    /// Plan a native change read over (before_exclusive, after_inclusive].
+    ///
+    /// The first output column must be [`CHANGE_KIND_COLUMN`] as non-null Int32:
+    /// [`dynamic_lake_core::RowKind::Negative`] for a removed row or before image, and
+    /// [`dynamic_lake_core::RowKind::Positive`] for an added row or after image.
+    async fn plan_changes(
+        &self,
+        session: &dyn Session,
+        request: ChangeReadPlanRequest,
+    ) -> super::LakeFormatResult<ReadPlan> {
+        let _ = (session, request);
+        Err(super::LakeFormatError::Unsupported(
+            "native change reads".to_string(),
+        ))
+    }
 
     async fn plan_write(
         &self,

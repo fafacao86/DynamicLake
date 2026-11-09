@@ -158,7 +158,7 @@ mod tests {
             .expect("delta plan");
         let display = plan.display_indent().to_string();
         assert_eq!(display.matches("IvmDeltaScan").count(), 1);
-        assert!(display.contains("Filter: Boolean(false)"));
+        assert!(!display.contains("Filter: Boolean(false)"));
         Ok(())
     }
 
@@ -177,14 +177,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn secondary_delta_is_noop_when_changed_input_reaches_all_inputs()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn preserved_side_change_uses_primary_only() -> Result<(), Box<dyn std::error::Error>> {
         let plan = rewrite("SELECT a_id, b_id FROM a LEFT JOIN b ON a_id = b_id", "a")
             .await?
             .expect("delta plan");
         let display = plan.display_indent().to_string();
         assert!(!display.contains("LeftSemi Join"));
         assert!(!display.contains("LeftAnti Join"));
+        assert!(!display.contains("Boolean(false)"));
         Ok(())
     }
 }

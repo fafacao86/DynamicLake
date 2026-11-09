@@ -1,14 +1,14 @@
 use std::error::Error;
 use std::sync::Arc;
 
-use datafusion::arrow::array::Int64Array;
+use datafusion::arrow::array::{Int32Array, Int64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use datafusion::physical_plan::collect;
 use datafusion::prelude::SessionContext;
-use dynamic_lake_core::TableIdentifier;
+use dynamic_lake_core::{IncrementInterval, RowKind, TableIdentifier};
 use dynamic_lake_format::{
-    CreateDatabaseRequest, CreateTableRequest, LakeFormat, ReadPlanRequest, WriteMode,
-    WritePlanRequest,
+    CHANGE_KIND_COLUMN, ChangeReadPlanRequest, CreateDatabaseRequest, CreateTableRequest,
+    LakeFormat, ReadPlanRequest, WriteMode, WritePlanRequest,
 };
 use dynamic_lake_paimon::PaimonFormat;
 use paimon::Options;
@@ -89,7 +89,7 @@ async fn writes_and_reads_back_through_paimon_format_interface() -> Result<(), B
         .plan_read(
             &state,
             ReadPlanRequest {
-                table,
+                table: table.clone(),
                 snapshot: metadata.latest_version(),
                 projection: Some(vec![0, 1]),
                 filters: Vec::new(),
@@ -118,5 +118,34 @@ async fn writes_and_reads_back_through_paimon_format_interface() -> Result<(), B
     rows.sort_unstable();
 
     assert_eq!(rows, vec![(1, 10), (2, 20)]);
+
+    let snapshot = metadata
+        .latest_version()
+        .expect("write produced a snapshot");
+    let changes = planner
+        .plan_changes(
+            &state,
+            ChangeReadPlanRequest {
+                table,
+                interval: IncrementInterval::try_new(snapshot - 1, snapshot)?,
+            },
+        )
+        .await?;
+    let batches = collect(changes.execution, session.task_ctx()).await?;
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        2
+    );
+    for batch in batches {
+        assert_eq!(batch.schema().field(0).name(), CHANGE_KIND_COLUMN);
+        let kinds = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("change kind should be Int32");
+        for row in 0..batch.num_rows() {
+            assert_eq!(kinds.value(row), RowKind::Positive.code());
+        }
+    }
     Ok(())
 }

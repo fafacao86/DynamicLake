@@ -32,12 +32,10 @@ pub(super) fn backend_error(error: impl std::fmt::Display) -> MetastoreError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use dynamic_lake_core::{
-        IncrementInterval, IvmStreamObject, MaterializedViewDefinition, MetastoreRepository,
-        NodeId, StreamIntervals, TableName,
+        IvmStreamObject, MaterializedViewDefinition, MetastoreRepository, NodeId, TableName,
     };
 
     use super::*;
@@ -70,7 +68,7 @@ mod tests {
                 .load_mv_definition(&node_id)
                 .await
                 .expect("load definition"),
-            Some(definition)
+            Some(definition.clone())
         );
         assert_eq!(
             repository
@@ -79,18 +77,17 @@ mod tests {
                 .expect("list streams"),
             vec![stream.clone()]
         );
+        let advanced = stream.advanced_to(4).expect("advance cursor");
+        repository
+            .save_refresh_metadata(&definition, std::slice::from_ref(&advanced))
+            .await
+            .expect("save refresh metadata");
         assert_eq!(
             repository
-                .load_stream_intervals(&node_id)
+                .list_stream_objects(&node_id)
                 .await
-                .expect("load intervals"),
-            Some(StreamIntervals::new(
-                node_id,
-                BTreeMap::from([(
-                    stream.source,
-                    IncrementInterval::try_new(2, 2).expect("interval"),
-                )]),
-            ))
+                .expect("list advanced streams"),
+            vec![advanced]
         );
     }
 }

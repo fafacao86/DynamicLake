@@ -7,6 +7,7 @@ members = [
     "crates/dynamic-lake-datafusion",
     "crates/dynamic-lake-client",
     "crates/dynamic-lake-paimon",
+    "crates/dynamic-lake-benchmark",
 ]
 default-members = [
     "crates/dynamic-lake-core",
@@ -15,6 +16,7 @@ default-members = [
     "crates/dynamic-lake-datafusion",
     "crates/dynamic-lake-client",
     "crates/dynamic-lake-paimon",
+    "crates/dynamic-lake-benchmark",
 ]
 exclude = [
     "third-party/paimon-rust",

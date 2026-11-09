@@ -1,0 +1,20 @@
+[package]
+name = "dynamic-lake-benchmark"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+datafusion.workspace = true
+dynamic-lake-client = { path = "../dynamic-lake-client" }
+dynamic-lake-core = { path = "../dynamic-lake-core" }
+dynamic-lake-datafusion = { path = "../dynamic-lake-datafusion" }
+dynamic-lake-format = { path = "../dynamic-lake-format" }
+dynamic-lake-paimon = { path = "../dynamic-lake-paimon" }
+paimon = { path = "../../third-party/paimon-rust/crates/paimon", default-features = false, features = ["storage-fs", "storage-memory"] }
+tempfile = "3"
+tokio.workspace = true
+
+[lints]
+workspace = true

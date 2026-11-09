@@ -1,17 +1,19 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use datafusion::common::{Column, DFSchema, ScalarValue};
-use datafusion::logical_expr::logical_plan::{Filter, Projection, Sort, Union};
-use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, SortExpr, lit};
+use datafusion::common::{Column, ScalarValue};
+use datafusion::logical_expr::logical_plan::{Filter, Sort, Union};
+use datafusion::logical_expr::{Expr, LogicalPlan, SortExpr, lit};
 
+use crate::ivm::cte_utils::cte_ref;
 use crate::ivm::error::IvmError;
 use crate::ivm::normalize::{DeltaRowKind, ROW_KIND_COLUMN};
 use crate::ivm::ojv::{OjvInputId, OjvSecondaryDeltaPlanner, PrimaryDeltaPlanner};
+use crate::ivm::plan_utils::project_plan;
 
 use super::super::IvmDeltaRewriter;
 
-const APPLY_PHASE_COLUMN: &str = "__ivm_apply_phase";
+const APPLY_PHASE_COLUMN: &str = "__ivm_ojv_apply_phase";
 
 pub(crate) struct OjvDeltaHandler;
 
@@ -53,55 +55,94 @@ impl OjvDeltaHandler {
             };
             rewritten_inputs.insert(input.id, plan);
         }
-        let primary = PrimaryDeltaPlanner.plan(multi_join, changed_input, &rewritten_inputs)?;
-        let after_view = context.snapshots.after(join_root)?;
-        Ok(Some(self.plan_apply(
-            primary,
-            context.analysis,
-            multi_join,
-            changed_input,
-            &after_view,
-        )?))
+        let primary =
+            cte_ref(PrimaryDeltaPlanner.plan(multi_join, changed_input, &rewritten_inputs)?)?;
+        let secondary = OjvSecondaryDeltaPlanner::new(context.analysis, multi_join, changed_input)?;
+        if !secondary.needs_secondary() {
+            return Ok(Some(self.plan_primary_only(primary)?));
+        }
+        let before_view = context.snapshots.before(join_root)?;
+        Ok(Some(self.plan_apply(primary, &secondary, &before_view)?))
+    }
+
+    fn plan_primary_only(&self, primary: LogicalPlan) -> Result<LogicalPlan, IvmError> {
+        let primary_delete = filter_row_kind(&primary, DeltaRowKind::Negative)?;
+        let primary_insert = filter_row_kind(&primary, DeltaRowKind::Positive)?;
+        let branches = primary_branches(&primary, &primary_delete, &primary_insert)?;
+        finish_apply(&primary, branches)
     }
 
     fn plan_apply(
         &self,
         primary: LogicalPlan,
-        analysis: &crate::ivm::ojv::OjvAnalysis,
-        multi_join: &crate::ivm::ojv::OjvMultiJoin,
-        changed_input: OjvInputId,
-        after_view: &LogicalPlan,
+        secondary: &OjvSecondaryDeltaPlanner<'_>,
+        before_view: &LogicalPlan,
     ) -> Result<LogicalPlan, IvmError> {
         let primary_delete = filter_row_kind(&primary, DeltaRowKind::Negative)?;
         let primary_insert = filter_row_kind(&primary, DeltaRowKind::Positive)?;
-        let secondary = OjvSecondaryDeltaPlanner::new(analysis, multi_join, changed_input)?;
-        let secondary_delete = if secondary.is_no_op() {
-            empty_branch(&primary, DeltaRowKind::Negative)?
-        } else {
-            secondary.ceased_orphans(&primary_insert, after_view)?
-        };
-        let secondary_insert = if secondary.is_no_op() {
-            empty_branch(&primary, DeltaRowKind::Positive)?
-        } else {
-            secondary.new_orphans(&primary_delete, after_view)?
-        };
-
-        let branches = [
-            canonical_branch(&primary_delete, &primary, DeltaRowKind::Negative, 0)?,
-            canonical_branch(&primary_insert, &primary, DeltaRowKind::Positive, 1)?,
-            canonical_branch(&secondary_delete, &primary, DeltaRowKind::Negative, 2)?,
-            canonical_branch(&secondary_insert, &primary, DeltaRowKind::Positive, 3)?,
-        ];
-        let union = LogicalPlan::Union(Union::try_new(
-            branches.into_iter().map(Arc::new).collect(),
+        let mut branches = primary_branches(&primary, &primary_delete, &primary_insert)?;
+        // V1 is the view after applying the primary delta. The secondary
+        // planner uses it to find removed and newly created orphan rows.
+        let applied_view =
+            cte_ref(secondary.apply_primary(before_view, &primary_delete, &primary_insert)?)?;
+        let secondary_delete = secondary.ceased_orphans(&primary_insert, &applied_view)?;
+        let secondary_insert = secondary.new_orphans(&primary_delete, &applied_view)?;
+        branches.push(canonical_branch(
+            &secondary_delete,
+            &primary,
+            DeltaRowKind::Negative,
+            2,
         )?);
-        let phase = Column::from_name(APPLY_PHASE_COLUMN);
-        Ok(LogicalPlan::Sort(Sort {
-            expr: vec![SortExpr::new(Expr::Column(phase), true, false)],
-            input: Arc::new(union),
-            fetch: None,
-        }))
+        branches.push(canonical_branch(
+            &secondary_insert,
+            &primary,
+            DeltaRowKind::Positive,
+            3,
+        )?);
+        finish_apply(&primary, branches)
     }
+}
+
+fn primary_branches(
+    primary: &LogicalPlan,
+    primary_delete: &LogicalPlan,
+    primary_insert: &LogicalPlan,
+) -> Result<Vec<LogicalPlan>, IvmError> {
+    Ok(vec![
+        canonical_branch(primary_delete, primary, DeltaRowKind::Negative, 0)?,
+        canonical_branch(primary_insert, primary, DeltaRowKind::Positive, 1)?,
+    ])
+}
+
+fn finish_apply(
+    primary: &LogicalPlan,
+    branches: Vec<LogicalPlan>,
+) -> Result<LogicalPlan, IvmError> {
+    let union = LogicalPlan::Union(Union::try_new(
+        branches.into_iter().map(Arc::new).collect(),
+    )?);
+    let phase = Column::from_name(APPLY_PHASE_COLUMN);
+    // DataFusion's Union drops field qualifiers. Restore the primary
+    // schema so outer projections can still resolve qualified columns.
+    let exprs = union
+        .schema()
+        .columns()
+        .into_iter()
+        .zip(
+            primary
+                .schema()
+                .columns()
+                .into_iter()
+                .chain([phase.clone()]),
+        )
+        .map(|(actual, target)| Expr::Column(actual).alias_qualified(target.relation, target.name))
+        .collect();
+    let qualified = project_plan(union, exprs)?;
+    Ok(LogicalPlan::Sort(Sort {
+        expr: vec![SortExpr::new(Expr::Column(phase), true, false)],
+        input: Arc::new(qualified),
+        fetch: None,
+    }))
 }
 
 fn filter_row_kind(plan: &LogicalPlan, row_kind: DeltaRowKind) -> Result<LogicalPlan, IvmError> {
@@ -109,11 +150,6 @@ fn filter_row_kind(plan: &LogicalPlan, row_kind: DeltaRowKind) -> Result<Logical
         Expr::Column(Column::from_name(ROW_KIND_COLUMN)).eq(lit(row_kind.code())),
         Arc::new(plan.clone()),
     )?))
-}
-
-fn empty_branch(primary: &LogicalPlan, row_kind: DeltaRowKind) -> Result<LogicalPlan, IvmError> {
-    let empty = LogicalPlan::Filter(Filter::try_new(lit(false), Arc::new(primary.clone()))?);
-    canonical_branch(&empty, primary, row_kind, usize::MAX)
 }
 
 fn canonical_branch(
@@ -129,33 +165,23 @@ fn canonical_branch(
         } else {
             let fallback = resolve_by_name(branch, &column.name)?;
             match fallback {
-                Some(column) => Expr::Column(column.clone()).alias(&column.name),
+                Some(resolved) => {
+                    Expr::Column(resolved).alias_qualified(column.relation.clone(), &column.name)
+                }
                 None => {
                     let index = primary.schema().index_of_column(&column)?;
                     Expr::Literal(
                         ScalarValue::try_from(primary.schema().field(index).data_type())?,
                         None,
                     )
-                    .alias(column.name)
+                    .alias_qualified(column.relation.clone(), &column.name)
                 }
             }
         };
         exprs.push(expr);
     }
     exprs.push(lit(phase as i32).alias(APPLY_PHASE_COLUMN));
-    let fields = exprs
-        .iter()
-        .map(|expr| expr.to_field(branch.schema()))
-        .collect::<datafusion::error::Result<Vec<_>>>()?;
-    let schema = Arc::new(DFSchema::new_with_metadata(
-        fields,
-        branch.schema().metadata().clone(),
-    )?);
-    Ok(LogicalPlan::Projection(Projection::try_new_with_schema(
-        exprs,
-        Arc::new(branch.clone()),
-        schema,
-    )?))
+    Ok(project_plan(branch.clone(), exprs)?)
 }
 
 fn resolve_by_name(plan: &LogicalPlan, name: &str) -> Result<Option<Column>, IvmError> {

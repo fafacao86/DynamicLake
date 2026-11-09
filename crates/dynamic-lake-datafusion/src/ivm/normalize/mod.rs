@@ -12,8 +12,8 @@ use crate::ivm::error::IvmError;
 
 pub use hash::{IvmSha1, ivm_sha1, ivm_sha1_expr, register_ivm_functions};
 pub use row_id::{
-    DML_FACTOR_COLUMN, DeltaRowKind, ROW_ID_COLUMN, ROW_KIND_COLUMN, RowIdDomain, hidden_row_id,
-    row_id_columns, single_row_id,
+    DeltaRowKind, ROW_ID_COLUMN, ROW_KIND_COLUMN, RowIdDomain, hidden_row_id, row_id_columns,
+    single_row_id,
 };
 
 /// The logical plan persisted for an incrementally maintained materialized view.
@@ -148,7 +148,10 @@ impl IvmNormalizer {
     }
 
     fn normalize_join(&self, join: Join) -> Result<LogicalPlan, IvmError> {
-        if !matches!(join.join_type, JoinType::Inner | JoinType::Left) {
+        if !matches!(
+            join.join_type,
+            JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
+        ) {
             return Err(IvmError::UnsupportedJoinType(join.join_type));
         }
         let left = Arc::new(self.normalize_plan((*join.left).clone())?);

@@ -6,6 +6,7 @@ pub mod graph;
 pub mod meta;
 pub mod model;
 pub mod refresh;
+pub mod row_kind;
 pub mod service;
 
 pub use error::{PipelineError, PipelineResult};
@@ -16,11 +17,12 @@ pub use execution::{
 pub use graph::{DynamicPipelineGraph, GraphOperations, PipelineGraph};
 pub use meta::{
     IncrementInterval, IvmStreamObject, KvTransaction, MaterializedViewDefinition, MetastoreError,
-    MetastoreRepository, MetastoreResult, StreamIntervals, StreamStatus, TransactionalKvStore,
+    MetastoreRepository, MetastoreResult, StreamStatus, TransactionalKvStore,
 };
 pub use model::{DynamicTable, NodeId, PipelineBuildOptions, TableIdentifier, TableName};
 pub use refresh::{
     NodeRefreshMode, PipelineCatalog, RefreshMode, RefreshPlan, RefreshPlanner, RefreshReason,
     RefreshRequest, RefreshStep,
 };
+pub use row_kind::RowKind;
 pub use service::PipelineService;
