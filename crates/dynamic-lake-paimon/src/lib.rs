@@ -21,7 +21,7 @@ use datafusion::physical_plan::expressions::{CaseExpr, Column, Literal};
 use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use dynamic_lake_core::{
-    IVM_ROW_KIND_COLUMN, PipelineCatalog, PipelineError, PipelineResult, RowKind, TableIdentifier,
+    IVM_ROW_KIND_COLUMN, PipelineError, PipelineResult, RowKind, TableIdentifier,
 };
 use dynamic_lake_format::{
     AlterTableRequest, ChangeReadPlanRequest, CreateDatabaseRequest, CreateTableRequest,
@@ -363,9 +363,11 @@ impl LakeTablePlanner for PaimonFormat {
         }
         let input: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(request.input));
         let execution = match request.mode {
-            WriteMode::Replace => {
+            WriteMode::Change => {
                 let input = project_change_write(input, &table)?;
                 let schema = input.schema();
+                // The provider sink expects table columns only. Change writes also carry
+                // `_VALUE_KIND`, so they need a sink with the projected input schema.
                 Arc::new(DataSinkExec::new(
                     input,
                     Arc::new(PaimonChangeSink::new(table, schema)),
@@ -434,40 +436,6 @@ fn project_change_write(
         alias: VALUE_KIND_FIELD_NAME.to_string(),
     });
     Ok(Arc::new(ProjectionExec::try_new(projections, input)?))
-}
-
-#[derive(Clone)]
-pub struct PaimonPipelineCatalog {
-    format: Arc<PaimonFormat>,
-}
-
-impl PaimonPipelineCatalog {
-    pub fn new(catalog: Arc<dyn Catalog>) -> Self {
-        Self {
-            format: Arc::new(PaimonFormat::new(catalog)),
-        }
-    }
-
-    pub fn from_format(format: Arc<PaimonFormat>) -> Self {
-        Self { format }
-    }
-}
-
-#[async_trait]
-impl PipelineCatalog for PaimonPipelineCatalog {
-    async fn latest_version(&self, table: &TableIdentifier) -> PipelineResult<i64> {
-        self.format
-            .metadata(table)
-            .await
-            .map_err(|error| PipelineError::Catalog(error.to_string()))?
-            .latest_version()
-            .ok_or_else(|| {
-                PipelineError::Catalog(format!(
-                    "Paimon table `{}` does not expose a latest version",
-                    table
-                ))
-            })
-    }
 }
 
 pub async fn register_paimon_catalog(

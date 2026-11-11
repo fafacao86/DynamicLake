@@ -9,12 +9,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use dynamic_lake_core::{PipelineBuildOptions, PipelineResult, TableIdentifier};
 use dynamic_lake_format::{CreateDatabaseRequest, CreateTableRequest};
 
-/// A SQL definition sent to the pipeline server for analysis.
-#[derive(Debug, Clone)]
-pub struct ViewDefinition {
-    pub name: String,
-    pub sql: String,
-}
+pub use dynamic_lake_core::ViewDefinition;
 
 #[derive(Clone)]
 pub struct PipelineClient {
@@ -81,12 +76,14 @@ impl PipelineClient {
         self.backend.register_table_snapshot(table).await
     }
 
-    pub async fn trigger_incremental_refresh(&self, view: &TableIdentifier) -> PipelineResult<()> {
-        self.backend.refresh_incremental(view).await
+    /// Check and refresh every registered view in dependency order.
+    pub async fn trigger_incremental_refresh(&self) -> PipelineResult<()> {
+        self.backend.refresh_incremental().await
     }
 
-    pub async fn trigger_full_refresh(&self, view: &TableIdentifier) -> PipelineResult<()> {
-        self.backend.refresh_full(view).await
+    /// Recompute every registered view in dependency order.
+    pub async fn trigger_full_refresh(&self) -> PipelineResult<()> {
+        self.backend.refresh_full().await
     }
 }
 
@@ -104,17 +101,10 @@ impl MaterializedViewBuilder {
         self
     }
 
-    pub async fn build(self) -> PipelineResult<()> {
-        self.client
-            .backend
-            .define_views(self.definitions, self.client.build_options, false)
-            .await
-    }
-
     pub async fn create(self) -> PipelineResult<()> {
         self.client
             .backend
-            .define_views(self.definitions, self.client.build_options, true)
+            .create_views(self.definitions, self.client.build_options)
             .await
     }
 }

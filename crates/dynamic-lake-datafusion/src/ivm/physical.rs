@@ -4,7 +4,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::compute::cast;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::{QueryPlanner, SessionState};
@@ -169,7 +170,13 @@ fn adapt_scan_schema(
         ));
     }
     for (actual, expected) in source.fields().iter().zip(schema.fields()) {
-        if actual.name() != expected.name() || actual.data_type() != expected.data_type() {
+        if actual.name() != expected.name()
+            || (actual.data_type() != expected.data_type()
+                && !matches!(
+                    (actual.data_type(), expected.data_type()),
+                    (DataType::Utf8View, DataType::Utf8)
+                ))
+        {
             return Err(DataFusionError::Plan(format!(
                 "IVM scan field differs: physical {actual:?}, logical {expected:?}"
             )));
@@ -220,7 +227,19 @@ impl PartitionStream for AdaptedPartition {
 }
 
 fn adapt_batch_schema(batch: RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
-    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+    let columns = schema
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .map(|(field, column)| {
+            if column.data_type() == field.data_type() {
+                Ok(Arc::clone(column))
+            } else {
+                cast(column, field.data_type()).map_err(DataFusionError::from)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (field, column) in schema.fields().iter().zip(&columns) {
         if !field.is_nullable() && column.null_count() != 0 {
             return Err(DataFusionError::Execution(format!(
                 "IVM scan produced nulls for required field `{}`",
@@ -228,5 +247,5 @@ fn adapt_batch_schema(batch: RecordBatch, schema: SchemaRef) -> Result<RecordBat
             )));
         }
     }
-    Ok(RecordBatch::try_new(schema, batch.columns().to_vec())?)
+    Ok(RecordBatch::try_new(schema, columns)?)
 }

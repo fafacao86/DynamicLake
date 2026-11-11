@@ -1,9 +1,8 @@
 //! Open lake table format SPI.
 //!
 //! Format implementations (Paimon, Delta, Iceberg, ...) live in
-//! separate crates. The DAG/refresh layer only consumes
-//! [`dynamic_lake_core::PipelineCatalog`]; this crate adds the catalog DDL and
-//! DataFusion plan-node boundaries needed by a concrete backend.
+//! separate crates. This crate provides catalog DDL and DataFusion plan-node
+//! boundaries needed by a concrete backend.
 
 pub mod catalog;
 pub mod error;

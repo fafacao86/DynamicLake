@@ -26,6 +26,7 @@ impl MetastoreRepository {
         definition: &MaterializedViewDefinition,
         streams: &[IvmStreamObject],
     ) -> MetastoreResult<()> {
+        definition.validate_version()?;
         let mut transaction = self.store.begin().await?;
         let result = async {
             if definition.plan_signature.is_empty() {
@@ -54,6 +55,7 @@ impl MetastoreRepository {
         &self,
         definition: &MaterializedViewDefinition,
     ) -> MetastoreResult<()> {
+        definition.validate_version()?;
         let key = mv_definition_key(&definition.node_id)?;
         let value = encode(definition)?;
         let mut transaction = self.store.begin().await?;
@@ -65,14 +67,25 @@ impl MetastoreRepository {
         &self,
         node_id: &NodeId,
     ) -> MetastoreResult<Option<MaterializedViewDefinition>> {
-        self.load(mv_definition_key(node_id)?).await
+        let definition: Option<MaterializedViewDefinition> =
+            self.load(mv_definition_key(node_id)?).await?;
+        if let Some(definition) = &definition {
+            definition.validate_version()?;
+        }
+        Ok(definition)
     }
 
     pub async fn list_mv_definitions(&self) -> MetastoreResult<Vec<MaterializedViewDefinition>> {
         let mut transaction = self.store.begin().await?;
         let rows = transaction.scan_prefix(&mv_definitions_prefix()?).await?;
         transaction.rollback().await?;
-        rows.into_iter().map(|(_, value)| decode(&value)).collect()
+        rows.into_iter()
+            .map(|(_, value)| {
+                let definition: MaterializedViewDefinition = decode(&value)?;
+                definition.validate_version()?;
+                Ok(definition)
+            })
+            .collect()
     }
 
     pub async fn save_stream_object(&self, stream: &IvmStreamObject) -> MetastoreResult<()> {
@@ -109,6 +122,7 @@ impl MetastoreRepository {
         definition: &MaterializedViewDefinition,
         streams: &[IvmStreamObject],
     ) -> MetastoreResult<()> {
+        definition.validate_version()?;
         for stream in streams {
             validate_stream(definition, stream)?;
         }
@@ -120,6 +134,7 @@ impl MetastoreRepository {
                 MetastoreError::Encoding("materialized view definition does not exist".to_string())
             })?;
             let previous: MaterializedViewDefinition = decode(&stored)?;
+            previous.validate_version()?;
             if previous.plan_signature.is_empty()
                 || previous.plan_signature != definition.plan_signature
             {

@@ -41,57 +41,6 @@ pub trait GraphOperations {
         self.nodes().get(id)
     }
 
-    fn required_nodes(&self, id: &NodeId) -> BTreeSet<NodeId> {
-        self.node(id)
-            .map(|node| node.upstream.clone())
-            .unwrap_or_default()
-    }
-
-    fn downstream_nodes(&self, id: &NodeId) -> BTreeSet<NodeId> {
-        self.nodes()
-            .iter()
-            .filter_map(|(node_id, node)| node.upstream.contains(id).then_some(node_id.clone()))
-            .collect()
-    }
-
-    fn upstream_closure(&self, roots: impl IntoIterator<Item = NodeId>) -> BTreeSet<NodeId> {
-        self.closure(roots, |node| node.upstream.clone())
-    }
-
-    fn downstream_closure(&self, roots: impl IntoIterator<Item = NodeId>) -> BTreeSet<NodeId> {
-        self.closure(roots, |node| {
-            self.nodes()
-                .iter()
-                .filter_map(|(id, candidate)| {
-                    candidate.upstream.contains(&node.id).then_some(id.clone())
-                })
-                .collect()
-        })
-    }
-
-    fn resolve_node(&self, selector: &str) -> PipelineResult<NodeId> {
-        let selector = selector.to_ascii_lowercase();
-        let identifier = selector.parse::<NodeId>()?;
-        if self.nodes().contains_key(&identifier) {
-            return Ok(identifier);
-        }
-        let matches = self
-            .nodes()
-            .keys()
-            .filter(|id| id.table() == selector)
-            .cloned()
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [id] => Ok(id.clone()),
-            [] => Err(PipelineError::Invalid(format!(
-                "dynamic table `{selector}` was not found"
-            ))),
-            _ => Err(PipelineError::Invalid(format!(
-                "dynamic table selector `{selector}` is ambiguous"
-            ))),
-        }
-    }
-
     fn validate(&self) -> PipelineResult<()> {
         let mut visited = BTreeSet::new();
         for id in self.topological_order() {
@@ -113,24 +62,6 @@ pub trait GraphOperations {
             visited.insert(id.clone());
         }
         Ok(())
-    }
-
-    fn closure(
-        &self,
-        roots: impl IntoIterator<Item = NodeId>,
-        expand: impl Fn(&DynamicTable) -> BTreeSet<NodeId>,
-    ) -> BTreeSet<NodeId> {
-        let mut visited = BTreeSet::new();
-        let mut queue = roots.into_iter().collect::<VecDeque<_>>();
-        while let Some(id) = queue.pop_front() {
-            if !self.nodes().contains_key(&id) || !visited.insert(id.clone()) {
-                continue;
-            }
-            if let Some(node) = self.nodes().get(&id) {
-                queue.extend(expand(node));
-            }
-        }
-        visited
     }
 }
 
@@ -215,25 +146,16 @@ mod tests {
     }
 
     #[test]
-    fn computes_diamond_closures() -> PipelineResult<()> {
+    fn orders_diamond_dependencies() -> PipelineResult<()> {
         let graph = DynamicPipelineGraph::try_new(BTreeMap::from([
             ("a".parse().expect("valid id"), node("a", &[])),
             ("b".parse().expect("valid id"), node("b", &["a"])),
             ("c".parse().expect("valid id"), node("c", &["a"])),
             ("d".parse().expect("valid id"), node("d", &["b", "c"])),
         ]))?;
-        assert_eq!(
-            graph
-                .upstream_closure(["d".parse().expect("valid id")])
-                .len(),
-            4
-        );
-        assert_eq!(
-            graph
-                .downstream_closure(["a".parse().expect("valid id")])
-                .len(),
-            4
-        );
+        let order = graph.topological_order();
+        assert_eq!(order.first().map(NodeId::table), Some("a"));
+        assert_eq!(order.last().map(NodeId::table), Some("d"));
         Ok(())
     }
 

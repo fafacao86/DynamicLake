@@ -61,13 +61,13 @@ mod tests {
         let repository = MetastoreRepository::new(store);
         let node_id: NodeId = "paimon.default.answer".parse().expect("node id");
         let source: TableName = "paimon.default.orders".parse().expect("source");
-        let definition = MaterializedViewDefinition {
-            node_id: node_id.clone(),
-            definition_format: "datafusion-logical-plan-json".to_string(),
-            definition: b"normalized-plan".to_vec(),
-            plan_signature: "sig".to_string(),
-            output_version: Some(3),
-        };
+        let mut definition = MaterializedViewDefinition::new(
+            node_id.clone(),
+            "SELECT * FROM orders".to_string(),
+            Default::default(),
+            "sig".to_string(),
+        );
+        definition.output_version = Some(3);
         let stream = IvmStreamObject::create(node_id.clone(), source, Some(2));
 
         repository
@@ -82,6 +82,9 @@ mod tests {
                 .expect("load definition"),
             Some(definition.clone())
         );
+        let mut unsupported = definition.clone();
+        unsupported.definition_version += 1;
+        assert!(repository.save_mv_definition(&unsupported).await.is_err());
         assert_eq!(
             repository
                 .list_stream_objects(&node_id)

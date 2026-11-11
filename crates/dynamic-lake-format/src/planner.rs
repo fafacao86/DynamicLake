@@ -44,7 +44,7 @@ pub struct ReadPlan {
 pub enum WriteMode {
     Append,
     Overwrite,
-    Replace,
+    Change,
 }
 
 pub struct WritePlanRequest {

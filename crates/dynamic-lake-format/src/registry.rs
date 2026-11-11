@@ -1,14 +1,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::TableReference;
 use datafusion::datasource::MemTable;
 use datafusion::physical_plan::collect;
 use datafusion::prelude::SessionContext;
-use dynamic_lake_core::{PipelineCatalog, PipelineError, PipelineResult, TableIdentifier};
+use dynamic_lake_core::TableIdentifier;
 
 use crate::{
     AlterTableRequest, CreateDatabaseRequest, CreateTableRequest, DropDatabaseRequest,
@@ -123,7 +122,7 @@ impl LakeFormatRegistry {
             session,
             table,
             batches,
-            WriteMode::Replace,
+            WriteMode::Change,
             Some(expected_snapshot),
         )
         .await
@@ -262,21 +261,5 @@ impl LakeFormatRegistry {
             ))
         })?;
         Ok(format)
-    }
-}
-
-#[async_trait]
-impl PipelineCatalog for LakeFormatRegistry {
-    async fn latest_version(&self, table: &TableIdentifier) -> PipelineResult<i64> {
-        let lake_table = self.get_table(table).await.map_err(|error| match error {
-            LakeFormatError::TableNotFound(name) => PipelineError::Catalog(name),
-            error => PipelineError::Catalog(error.to_string()),
-        })?;
-        lake_table.latest_version().ok_or_else(|| {
-            PipelineError::Catalog(format!(
-                "table `{}` does not expose a latest version",
-                table
-            ))
-        })
     }
 }

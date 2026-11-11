@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{NodeId, TableName};
+use crate::{NodeId, PipelineBuildOptions, TableName};
 
 use super::{MetastoreError, MetastoreResult};
 
@@ -81,14 +81,45 @@ impl IvmStreamObject {
     }
 }
 
-/// Opaque serialized MV definition owned by the execution backend.
+const MV_DEFINITION_VERSION: u32 = 1;
+
+/// Persisted SQL and refresh metadata for one materialized view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaterializedViewDefinition {
     pub node_id: NodeId,
-    pub definition_format: String,
-    pub definition: Vec<u8>,
+    pub definition_version: u32,
+    pub sql: String,
+    pub options: PipelineBuildOptions,
     pub plan_signature: String,
     pub output_version: Option<i64>,
+}
+
+impl MaterializedViewDefinition {
+    pub fn new(
+        node_id: NodeId,
+        sql: String,
+        options: PipelineBuildOptions,
+        plan_signature: String,
+    ) -> Self {
+        Self {
+            node_id,
+            definition_version: MV_DEFINITION_VERSION,
+            sql,
+            options,
+            plan_signature,
+            output_version: None,
+        }
+    }
+
+    pub(super) fn validate_version(&self) -> MetastoreResult<()> {
+        if self.definition_version != MV_DEFINITION_VERSION {
+            return Err(MetastoreError::Encoding(format!(
+                "unsupported MV definition version `{}` for `{}`",
+                self.definition_version, self.node_id
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn default_stream_name(node_id: &NodeId, source: &TableName) -> String {

@@ -18,6 +18,7 @@ use crate::tools::{tpch_dataset::tpch_dataset, write_rows};
 
 const OJV_SQL: &str = include_str!("../../sql/ojv.sql");
 const DOWNSTREAM_SQL: &str = include_str!("../../sql/ojv_downstream.sql");
+const THIRD_SQL: &str = include_str!("../../sql/ojv_third.sql");
 
 type Rows = BTreeMap<(i64, Option<i64>), i64>;
 
@@ -109,7 +110,7 @@ pub async fn run(row_count: i64, change_count: usize) -> Result<(), Box<dyn Erro
         ),
         "client writes to a materialized view must be rejected"
     );
-    client.trigger_full_refresh(&view).await?;
+    client.trigger_incremental_refresh().await?;
     client.register_table_snapshot(&view).await?;
 
     let downstream: TableIdentifier = "paimon.analytics.mv_downstream".parse()?;
@@ -117,46 +118,59 @@ pub async fn run(row_count: i64, change_count: usize) -> Result<(), Box<dyn Erro
         .materialized_view(downstream.to_string(), DOWNSTREAM_SQL)
         .create()
         .await?;
-    client.trigger_full_refresh(&downstream).await?;
+    client.trigger_incremental_refresh().await?;
+    client.register_table_snapshot(&downstream).await?;
+    let third: TableIdentifier = "paimon.analytics.mv_third".parse()?;
+    client
+        .materialized_view(third.to_string(), THIRD_SQL)
+        .create()
+        .await?;
+    client.trigger_incremental_refresh().await?;
     let downstream_before = visible_rows(client.query_sql(DOWNSTREAM_SQL).await?)?;
 
     let before = visible_rows(client.query_sql(OJV_SQL).await?)?;
     write_rows(&client, &b, dataset.new_orders, &b_schema).await?;
     let upstream_version = client.latest_version(&view).await?;
+    let downstream_version = client.latest_version(&downstream).await?;
+    let third_version = client.latest_version(&third).await?;
     let started = Instant::now();
-    client.trigger_incremental_refresh(&view).await?;
+    client.trigger_incremental_refresh().await?;
     let incremental_time = started.elapsed();
     let refreshed_upstream_version = client.latest_version(&view).await?;
+    let refreshed_downstream_version = client.latest_version(&downstream).await?;
+    let refreshed_third_version = client.latest_version(&third).await?;
     assert!(
         refreshed_upstream_version > upstream_version,
         "incremental refresh did not commit the upstream MV"
     );
-    client.trigger_incremental_refresh(&view).await?;
+    assert!(
+        refreshed_downstream_version > downstream_version,
+        "incremental refresh did not propagate to the downstream MV"
+    );
+    assert!(
+        refreshed_third_version > third_version,
+        "incremental refresh did not propagate through the third MV"
+    );
+    client.trigger_incremental_refresh().await?;
     assert_eq!(
         client.latest_version(&view).await?,
         refreshed_upstream_version,
         "the source cursor was not advanced after the MV commit"
+    );
+    assert_eq!(
+        client.latest_version(&downstream).await?,
+        refreshed_downstream_version,
+        "the downstream cursor was not advanced after the propagated refresh"
+    );
+    assert_eq!(
+        client.latest_version(&third).await?,
+        refreshed_third_version
     );
     let started = Instant::now();
     client.register_table_snapshot(&b).await?;
     let recomputed = visible_rows(client.query_sql(OJV_SQL).await?)?;
     let full_time = started.elapsed();
     assert_ne!(before, recomputed, "source append produced no view changes");
-    let downstream_version = client.latest_version(&downstream).await?;
-    let started = Instant::now();
-    client.trigger_incremental_refresh(&downstream).await?;
-    let downstream_time = started.elapsed();
-    let refreshed_downstream_version = client.latest_version(&downstream).await?;
-    assert!(
-        refreshed_downstream_version > downstream_version,
-        "incremental refresh did not commit the downstream MV"
-    );
-    client.trigger_incremental_refresh(&downstream).await?;
-    assert_eq!(
-        client.latest_version(&downstream).await?,
-        refreshed_downstream_version,
-        "the upstream MV cursor was not advanced after the downstream commit"
-    );
     client.register_table_snapshot(&view).await?;
     let persisted_upstream = visible_rows(
         client
@@ -182,6 +196,16 @@ pub async fn run(row_count: i64, change_count: usize) -> Result<(), Box<dyn Erro
         persisted_downstream, downstream_recomputed,
         "persisted downstream MV differs from full recompute"
     );
+    client.register_table_snapshot(&third).await?;
+    assert_eq!(
+        visible_rows(
+            client
+                .query_sql("SELECT id, b_id FROM paimon.analytics.mv_third")
+                .await?
+        )?,
+        downstream_recomputed,
+        "persisted third MV differs from full recompute"
+    );
     drop(client);
     let restarted = PipelineClient::new(Arc::new(
         InProcessPipelineClient::new(session, registry, &metadata_path, &RedbMetastoreFactory)
@@ -194,8 +218,7 @@ pub async fn run(row_count: i64, change_count: usize) -> Result<(), Box<dyn Erro
         ),
         "restarted server must still reject client writes to the MV"
     );
-    restarted.trigger_incremental_refresh(&view).await?;
-    restarted.trigger_incremental_refresh(&downstream).await?;
+    restarted.trigger_incremental_refresh().await?;
     assert_eq!(
         restarted.latest_version(&view).await?,
         refreshed_upstream_version,
@@ -206,8 +229,55 @@ pub async fn run(row_count: i64, change_count: usize) -> Result<(), Box<dyn Erro
         refreshed_downstream_version,
         "restarted server lost the downstream source cursor"
     );
+    assert_eq!(
+        restarted.latest_version(&third).await?,
+        refreshed_third_version
+    );
+    restarted.trigger_full_refresh().await?;
+    assert!(
+        restarted.latest_version(&view).await? > refreshed_upstream_version,
+        "full refresh did not commit the upstream MV"
+    );
+    assert!(
+        restarted.latest_version(&downstream).await? > refreshed_downstream_version,
+        "full refresh did not propagate to the downstream MV"
+    );
+    assert!(
+        restarted.latest_version(&third).await? > refreshed_third_version,
+        "full refresh did not propagate through the third MV"
+    );
+    restarted.register_table_snapshot(&view).await?;
+    restarted.register_table_snapshot(&downstream).await?;
+    restarted.register_table_snapshot(&third).await?;
+    assert_eq!(
+        visible_rows(
+            restarted
+                .query_sql("SELECT id, b_id FROM paimon.analytics.mv")
+                .await?
+        )?,
+        recomputed,
+        "full refresh produced stale upstream rows"
+    );
+    assert_eq!(
+        visible_rows(
+            restarted
+                .query_sql("SELECT id, b_id FROM paimon.analytics.mv_downstream")
+                .await?
+        )?,
+        downstream_recomputed,
+        "full refresh produced stale downstream rows"
+    );
+    assert_eq!(
+        visible_rows(
+            restarted
+                .query_sql("SELECT id, b_id FROM paimon.analytics.mv_third")
+                .await?
+        )?,
+        downstream_recomputed,
+        "full refresh produced stale third MV rows"
+    );
     println!(
-        "rows={row_count} changes={change_count} incremental={incremental_time:?} full={full_time:?} downstream={downstream_time:?} result_rows={}",
+        "rows={row_count} changes={change_count} incremental_chain={incremental_time:?} full={full_time:?} result_rows={}",
         recomputed.values().sum::<i64>()
     );
     Ok(())

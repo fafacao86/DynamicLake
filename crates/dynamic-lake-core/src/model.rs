@@ -1,11 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 
 use datafusion::logical_expr::LogicalPlan;
 use serde::{Deserialize, Serialize};
-
-use crate::meta::IvmStreamObject;
 
 /// Fully qualified table name used both as a graph node ID and a source name.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -104,7 +102,6 @@ pub struct DynamicTable {
     pub query: LogicalPlan,
     pub upstream: BTreeSet<NodeId>,
     pub external_inputs: BTreeSet<TableName>,
-    pub stream_objects: BTreeMap<TableName, IvmStreamObject>,
 }
 
 impl DynamicTable {
@@ -114,7 +111,6 @@ impl DynamicTable {
             query,
             upstream: BTreeSet::new(),
             external_inputs: BTreeSet::new(),
-            stream_objects: BTreeMap::new(),
         }
     }
 
@@ -125,11 +121,6 @@ impl DynamicTable {
 
     pub fn with_external_input(mut self, table: TableName) -> Self {
         self.external_inputs.insert(table);
-        self
-    }
-
-    pub fn with_stream_object(mut self, stream: IvmStreamObject) -> Self {
-        self.stream_objects.insert(stream.source.clone(), stream);
         self
     }
 }

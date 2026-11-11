@@ -11,10 +11,11 @@ pub mod ojv;
 pub mod physical;
 mod plan_utils;
 pub mod signature;
+mod view_compiler;
 
 pub use delta::{
     IncrementInterval, IvmDeltaRewriter, IvmRefreshContext, IvmRewriter, IvmScanKind, IvmScanNode,
-    IvmSnapshotPlanner,
+    IvmSnapshotPlanner, plan_incremental_view,
 };
 pub use error::IvmError;
 pub use normalize::{IvmNormalizer, NormalizedIvmPlan, ROW_ID_COLUMN, normalize_ivm_plan};
@@ -24,3 +25,4 @@ pub use ojv::{
 };
 pub use plan_utils::materialize_ctes;
 pub use signature::{IvmPlanSignature, IvmPlanSignatureGenerator};
+pub use view_compiler::{canonical_view_id, compile_view_definitions};
