@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use crate::NodeId;
 
-use super::key::{mv_definition_key, stream_object_key, stream_objects_prefix};
+use super::key::{
+    mv_definition_key, mv_definitions_prefix, stream_object_key, stream_objects_prefix,
+};
 use super::{
     IvmStreamObject, KvTransaction, MaterializedViewDefinition, MetastoreError, MetastoreResult,
     TransactionalKvStore,
@@ -64,6 +66,13 @@ impl MetastoreRepository {
         node_id: &NodeId,
     ) -> MetastoreResult<Option<MaterializedViewDefinition>> {
         self.load(mv_definition_key(node_id)?).await
+    }
+
+    pub async fn list_mv_definitions(&self) -> MetastoreResult<Vec<MaterializedViewDefinition>> {
+        let mut transaction = self.store.begin().await?;
+        let rows = transaction.scan_prefix(&mv_definitions_prefix()?).await?;
+        transaction.rollback().await?;
+        rows.into_iter().map(|(_, value)| decode(&value)).collect()
     }
 
     pub async fn save_stream_object(&self, stream: &IvmStreamObject) -> MetastoreResult<()> {

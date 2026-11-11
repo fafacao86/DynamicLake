@@ -45,12 +45,12 @@ pub struct OjvJoinInput {
 
 /// One directional edge in the forward join-key graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OjvJoinKeyBinding {
+pub struct OjvJoinKeyEdge {
     pub left_input: OjvInputId,
     pub right_input: OjvInputId,
 }
 
-impl OjvJoinKeyBinding {
+impl OjvJoinKeyEdge {
     pub fn new(left_input: OjvInputId, right_input: OjvInputId) -> Self {
         Self {
             left_input,
@@ -58,7 +58,7 @@ impl OjvJoinKeyBinding {
         }
     }
 
-    /// Build the directional bindings for the currently supported join shapes.
+    /// Build the directional edge for the currently supported join shapes.
     ///
     /// LEFT joins propagate changes from their preserved input to the
     /// null-extended input. Other join types are not supported yet.
@@ -86,7 +86,7 @@ pub struct OjvJoinNode {
     pub right: Box<OjvJoinTree>,
 }
 
-/// Explicit multi-join shape with stable input bindings.
+/// Explicit multi-join shape with stable input IDs.
 #[derive(Debug, Clone)]
 pub enum OjvJoinTree {
     Input(OjvInputId),
@@ -99,7 +99,7 @@ pub struct OjvMultiJoin {
     pub original_root: LogicalPlan,
     pub root: OjvJoinTree,
     pub inputs: BTreeMap<OjvInputId, OjvJoinInput>,
-    pub join_keys: Vec<OjvJoinKeyBinding>,
+    pub join_keys: Vec<OjvJoinKeyEdge>,
 }
 
 impl OjvMultiJoin {
@@ -107,7 +107,7 @@ impl OjvMultiJoin {
         original_root: LogicalPlan,
         root: OjvJoinTree,
         inputs: impl IntoIterator<Item = OjvJoinInput>,
-        join_keys: impl IntoIterator<Item = OjvJoinKeyBinding>,
+        join_keys: impl IntoIterator<Item = OjvJoinKeyEdge>,
     ) -> Result<Self, IvmError> {
         let mut input_map = BTreeMap::new();
         for input in inputs {
@@ -117,8 +117,8 @@ impl OjvMultiJoin {
             }
         }
         let join_keys = join_keys.into_iter().collect::<Vec<_>>();
-        for binding in &join_keys {
-            for id in [binding.left_input, binding.right_input] {
+        for edge in &join_keys {
+            for id in [edge.left_input, edge.right_input] {
                 if !input_map.contains_key(&id) {
                     return Err(IvmError::MissingJoinInput(id));
                 }

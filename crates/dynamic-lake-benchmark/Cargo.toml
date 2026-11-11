@@ -11,6 +11,7 @@ dynamic-lake-client = { path = "../dynamic-lake-client" }
 dynamic-lake-core = { path = "../dynamic-lake-core" }
 dynamic-lake-datafusion = { path = "../dynamic-lake-datafusion" }
 dynamic-lake-format = { path = "../dynamic-lake-format" }
+dynamic-lake-metastore-redb = { path = "../dynamic-lake-metastore-redb" }
 dynamic-lake-paimon = { path = "../dynamic-lake-paimon" }
 paimon = { path = "../../third-party/paimon-rust/crates/paimon", default-features = false, features = ["storage-fs", "storage-memory"] }
 tempfile = "3"

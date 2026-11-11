@@ -6,13 +6,18 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 datafusion.workspace = true
 dynamic-lake-core = { path = "../dynamic-lake-core" }
 dynamic-lake-datafusion = { path = "../dynamic-lake-datafusion" }
 dynamic-lake-format = { path = "../dynamic-lake-format" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+dynamic-lake-metastore-redb = { path = "../dynamic-lake-metastore-redb" }
+tempfile = "3"
 
 [lints]
 workspace = true

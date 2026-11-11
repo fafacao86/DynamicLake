@@ -1,7 +1,7 @@
 # DynamicLake
 
 Dynamic Lake is a Dynamic Table Service on Open Lake Table Formats (Iceberg, Paimon,
-etc.) based on DataFusion, Arrow, and Vortex.
+etc.) based on DataFusion, Arrow, Vortex, and Paimon.
 
 Work in progress, currently just for educational purpose
 

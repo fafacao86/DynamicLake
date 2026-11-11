@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ivm::error::IvmError;
 
-use super::{OjvInputId, OjvJoinKeyBinding, OjvMultiJoin};
+use super::{OjvInputId, OjvJoinKeyEdge, OjvMultiJoin};
 
 /// Forward dependency graph between OJV multi-join inputs.
 ///
@@ -21,7 +21,7 @@ pub struct ForwardJoinKeyGraph {
 impl ForwardJoinKeyGraph {
     pub fn try_new(
         inputs: impl IntoIterator<Item = OjvInputId>,
-        bindings: impl IntoIterator<Item = OjvJoinKeyBinding>,
+        edges: impl IntoIterator<Item = OjvJoinKeyEdge>,
     ) -> Result<Self, IvmError> {
         let inputs = inputs.into_iter().collect::<BTreeSet<_>>();
         if inputs.is_empty() {
@@ -37,17 +37,17 @@ impl ForwardJoinKeyGraph {
             .map(|input| (input, BTreeSet::new()))
             .collect::<BTreeMap<_, _>>();
 
-        for binding in bindings {
-            if !inputs.contains(&binding.left_input) {
-                return Err(IvmError::MissingJoinInput(binding.left_input));
+        for edge in edges {
+            if !inputs.contains(&edge.left_input) {
+                return Err(IvmError::MissingJoinInput(edge.left_input));
             }
-            if !inputs.contains(&binding.right_input) {
-                return Err(IvmError::MissingJoinInput(binding.right_input));
+            if !inputs.contains(&edge.right_input) {
+                return Err(IvmError::MissingJoinInput(edge.right_input));
             }
             successors
-                .get_mut(&binding.left_input)
+                .get_mut(&edge.left_input)
                 .expect("validated OJV input must exist")
-                .insert(binding.right_input);
+                .insert(edge.right_input);
         }
 
         Ok(Self {
@@ -58,12 +58,12 @@ impl ForwardJoinKeyGraph {
 
     pub fn from_multi_joins(multi_joins: &[OjvMultiJoin]) -> Result<Self, IvmError> {
         let mut inputs = BTreeSet::new();
-        let mut bindings = Vec::new();
+        let mut edges = Vec::new();
         for multi_join in multi_joins {
             inputs.extend(multi_join.input_ids());
-            bindings.extend(multi_join.join_keys.iter().cloned());
+            edges.extend(multi_join.join_keys.iter().cloned());
         }
-        Self::try_new(inputs, bindings)
+        Self::try_new(inputs, edges)
     }
 
     pub fn inputs(&self) -> &[OjvInputId] {
@@ -108,9 +108,9 @@ mod tests {
 
     #[test]
     fn left_join_edges_follow_preserved_to_null_side() {
-        let binding = OjvJoinKeyBinding::for_join(id(0), id(1), JoinType::Left)
-            .expect("left join is supported");
-        let graph = ForwardJoinKeyGraph::try_new([id(0), id(1)], [binding]).expect("valid graph");
+        let edge =
+            OjvJoinKeyEdge::for_join(id(0), id(1), JoinType::Left).expect("left join is supported");
+        let graph = ForwardJoinKeyGraph::try_new([id(0), id(1)], [edge]).expect("valid graph");
 
         assert_eq!(
             graph.successors(id(0)).expect("input 0"),
@@ -129,12 +129,12 @@ mod tests {
 
     #[test]
     fn one_input_can_have_multiple_successors() {
-        let bindings = vec![
-            OjvJoinKeyBinding::new(id(0), id(1)),
-            OjvJoinKeyBinding::new(id(0), id(2)),
+        let edges = vec![
+            OjvJoinKeyEdge::new(id(0), id(1)),
+            OjvJoinKeyEdge::new(id(0), id(2)),
         ];
         let graph =
-            ForwardJoinKeyGraph::try_new([id(0), id(1), id(2)], bindings).expect("valid graph");
+            ForwardJoinKeyGraph::try_new([id(0), id(1), id(2)], edges).expect("valid graph");
 
         assert_eq!(
             graph.reachable_from(id(0)).expect("reachable inputs"),
@@ -144,11 +144,11 @@ mod tests {
 
     #[test]
     fn reachable_from_terminates_when_graph_has_a_cycle() {
-        let bindings = vec![
-            OjvJoinKeyBinding::new(id(0), id(1)),
-            OjvJoinKeyBinding::new(id(1), id(0)),
+        let edges = vec![
+            OjvJoinKeyEdge::new(id(0), id(1)),
+            OjvJoinKeyEdge::new(id(1), id(0)),
         ];
-        let graph = ForwardJoinKeyGraph::try_new([id(0), id(1)], bindings).expect("valid graph");
+        let graph = ForwardJoinKeyGraph::try_new([id(0), id(1)], edges).expect("valid graph");
 
         assert_eq!(
             graph.reachable_from(id(0)).expect("reachable inputs"),
@@ -157,10 +157,10 @@ mod tests {
     }
 
     #[test]
-    fn non_left_join_bindings_are_rejected() {
+    fn non_left_join_edges_are_rejected() {
         for join_type in [JoinType::Inner, JoinType::Right, JoinType::Full] {
             assert!(matches!(
-                OjvJoinKeyBinding::for_join(id(0), id(1), join_type),
+                OjvJoinKeyEdge::for_join(id(0), id(1), join_type),
                 Err(IvmError::UnsupportedJoinType(rejected)) if rejected == join_type
             ));
         }
@@ -168,9 +168,9 @@ mod tests {
 
     #[test]
     fn graph_rejects_inputs_outside_the_multi_join() {
-        let binding = OjvJoinKeyBinding::new(id(0), id(9));
+        let edge = OjvJoinKeyEdge::new(id(0), id(9));
         assert!(matches!(
-            ForwardJoinKeyGraph::try_new([id(0), id(1)], [binding]),
+            ForwardJoinKeyGraph::try_new([id(0), id(1)], [edge]),
             Err(IvmError::MissingJoinInput(missing)) if missing == id(9)
         ));
     }

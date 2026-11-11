@@ -5,9 +5,9 @@ use datafusion::logical_expr::{Expr, LogicalPlan};
 
 use crate::ivm::error::IvmError;
 use crate::ivm::normalize::ROW_KIND_COLUMN;
+use crate::ivm::plan_utils::column_by_name;
 
 use super::super::IvmDeltaRewriter;
-use super::column_by_name;
 
 pub(crate) struct UnionDeltaHandler;
 
@@ -43,10 +43,10 @@ fn project_delta_branch(plan: &LogicalPlan, union: &Union) -> Result<Arc<Logical
         .zip(union.schema.fields())
         .map(|(column, field)| Expr::Column(column).alias(field.name()))
         .collect::<Vec<_>>();
-    exprs.push(Expr::Column(column_by_name(
-        plan.schema(),
-        ROW_KIND_COLUMN,
-    )?));
+    exprs.push(Expr::Column(
+        column_by_name(plan.schema(), ROW_KIND_COLUMN)?
+            .ok_or_else(|| IvmError::MissingHiddenColumn(ROW_KIND_COLUMN.to_string()))?,
+    ));
     Ok(Arc::new(LogicalPlan::Projection(Projection::try_new(
         exprs,
         Arc::new(plan.clone()),

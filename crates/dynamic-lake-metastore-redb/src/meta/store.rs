@@ -2,13 +2,25 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use dynamic_lake_core::{KvTransaction, MetastoreError, MetastoreResult, TransactionalKvStore};
+use dynamic_lake_core::{
+    KvTransaction, MetastoreError, MetastoreFactory, MetastoreResult, TransactionalKvStore,
+};
 use redb::Database;
 
 use super::transaction::RedbTransaction;
 
 pub struct RedbMetastore {
     db: Arc<Database>,
+}
+
+/// Opens redb metadata files for an in-process server.
+pub struct RedbMetastoreFactory;
+
+#[async_trait]
+impl MetastoreFactory for RedbMetastoreFactory {
+    async fn open(&self, path: &Path) -> MetastoreResult<Arc<dyn TransactionalKvStore>> {
+        Ok(Arc::new(RedbMetastore::open(path)?))
+    }
 }
 
 impl RedbMetastore {

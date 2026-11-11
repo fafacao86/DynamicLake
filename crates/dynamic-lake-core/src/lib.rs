@@ -17,7 +17,7 @@ pub use execution::{
 pub use graph::{DynamicPipelineGraph, GraphOperations, PipelineGraph};
 pub use meta::{
     IncrementInterval, IvmStreamObject, KvTransaction, MaterializedViewDefinition, MetastoreError,
-    MetastoreRepository, MetastoreResult, StreamStatus, TransactionalKvStore,
+    MetastoreFactory, MetastoreRepository, MetastoreResult, StreamStatus, TransactionalKvStore,
 };
 pub use model::{DynamicTable, NodeId, PipelineBuildOptions, TableIdentifier, TableName};
 pub use refresh::{

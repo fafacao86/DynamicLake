@@ -8,8 +8,7 @@ use datafusion::logical_expr::{Expr, LogicalPlan, SortExpr, lit};
 use crate::ivm::error::IvmError;
 use crate::ivm::normalize::{DeltaRowKind, ROW_KIND_COLUMN};
 use crate::ivm::ojv::{OjvInputId, OjvSecondaryDeltaPlanner, PrimaryDeltaPlanner};
-use crate::ivm::plan_utils::cte_ref;
-use crate::ivm::plan_utils::project_plan;
+use crate::ivm::plan_utils::{column_by_name, cte_ref, project_plan};
 
 use super::super::IvmDeltaRewriter;
 
@@ -163,7 +162,7 @@ fn canonical_branch(
         let expr = if column.name == ROW_KIND_COLUMN {
             lit(row_kind.code()).alias(ROW_KIND_COLUMN)
         } else {
-            let fallback = resolve_by_name(branch, &column.name)?;
+            let fallback = column_by_name(branch.schema(), &column.name)?;
             match fallback {
                 Some(resolved) => {
                     Expr::Column(resolved).alias_qualified(column.relation.clone(), &column.name)
@@ -182,18 +181,4 @@ fn canonical_branch(
     }
     exprs.push(lit(phase as i32).alias(APPLY_PHASE_COLUMN));
     Ok(project_plan(branch.clone(), exprs)?)
-}
-
-fn resolve_by_name(plan: &LogicalPlan, name: &str) -> Result<Option<Column>, IvmError> {
-    let columns = plan
-        .schema()
-        .iter()
-        .filter(|(_, field)| field.name() == name)
-        .map(|(qualifier, field)| Column::new(qualifier.cloned(), field.name()))
-        .collect::<Vec<_>>();
-    match columns.as_slice() {
-        [] => Ok(None),
-        [column] => Ok(Some(column.clone())),
-        _ => Err(IvmError::MissingHiddenColumn(name.to_string())),
-    }
 }

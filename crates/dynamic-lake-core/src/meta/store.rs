@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use std::path::Path;
+use std::sync::Arc;
 
 use super::MetastoreResult;
 
@@ -9,6 +11,12 @@ use super::MetastoreResult;
 #[async_trait]
 pub trait TransactionalKvStore: Send + Sync {
     async fn begin(&self) -> MetastoreResult<Box<dyn KvTransaction>>;
+}
+
+/// Opens a metadata store at a server-selected path.
+#[async_trait]
+pub trait MetastoreFactory: Send + Sync {
+    async fn open(&self, path: &Path) -> MetastoreResult<Arc<dyn TransactionalKvStore>>;
 }
 
 #[async_trait]

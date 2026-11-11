@@ -2,13 +2,12 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use datafusion::common::Column;
-use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::logical_expr::logical_plan::{Filter, Projection, TableScan};
 use datafusion::logical_expr::{Expr, LogicalPlan};
 
 use crate::ivm::error::IvmError;
 use crate::ivm::normalize::ROW_ID_COLUMN;
-use crate::ivm::plan_utils::{resolve_column, table_identifier};
+use crate::ivm::plan_utils::table_identifier;
 
 use super::super::IvmDeltaRewriter;
 use super::super::scan::IvmScanNode;
@@ -55,7 +54,7 @@ impl LinearDeltaHandler {
             if field.name() == ROW_ID_COLUMN && original_row_id_count != 1 {
                 continue;
             }
-            exprs.push(remap_columns(expr.clone(), &child)?);
+            exprs.push(expr.clone());
         }
         let mut hidden_names = projection
             .schema
@@ -90,21 +89,4 @@ impl LinearDeltaHandler {
             Arc::new(child),
         )?)))
     }
-}
-
-fn remap_columns(expr: Expr, child: &LogicalPlan) -> Result<Expr, IvmError> {
-    Ok(expr
-        .transform_up(|expr| {
-            let Expr::Column(column) = expr else {
-                return Ok(Transformed::no(expr));
-            };
-            Ok(Transformed::yes(Expr::Column(
-                resolve_column(child, &column).ok_or_else(|| {
-                    datafusion::error::DataFusionError::Plan(format!(
-                        "delta projection cannot resolve column `{column}`"
-                    ))
-                })?,
-            )))
-        })
-        .map(|transformed| transformed.data)?)
 }

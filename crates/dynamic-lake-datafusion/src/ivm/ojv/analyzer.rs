@@ -6,8 +6,7 @@ use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, Operator};
 use crate::ivm::error::IvmError;
 
 use super::{
-    OjvAnalysis, OjvInputId, OjvJoinInput, OjvJoinKeyBinding, OjvJoinNode, OjvJoinTree,
-    OjvMultiJoin,
+    OjvAnalysis, OjvInputId, OjvJoinInput, OjvJoinKeyEdge, OjvJoinNode, OjvJoinTree, OjvMultiJoin,
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -55,7 +54,7 @@ impl AnalyzerState {
     fn collect_join(
         &mut self,
         plan: &LogicalPlan,
-        join_keys: &mut Vec<OjvJoinKeyBinding>,
+        join_keys: &mut Vec<OjvJoinKeyEdge>,
         inputs: &mut BTreeMap<OjvInputId, OjvJoinInput>,
     ) -> Result<(OjvJoinTree, Vec<OjvInputId>), IvmError> {
         let LogicalPlan::Join(join) = plan else {
@@ -85,14 +84,14 @@ impl AnalyzerState {
         for (left_expr, right_expr) in &join.on {
             let left_bound = self.sources_of(left_expr, &left_sources, inputs)?;
             let right_bound = self.sources_of(right_expr, &right_sources, inputs)?;
-            join_keys.push(OjvJoinKeyBinding::for_join(
+            join_keys.push(OjvJoinKeyEdge::for_join(
                 left_bound,
                 right_bound,
                 join.join_type,
             )?);
         }
         if let Some(filter) = &join.filter {
-            self.collect_filter_bindings(
+            self.collect_filter_edges(
                 filter,
                 &left_sources,
                 &right_sources,
@@ -158,18 +157,18 @@ impl AnalyzerState {
         }
     }
 
-    fn collect_filter_bindings(
+    fn collect_filter_edges(
         &self,
         filter: &Expr,
         left_sources: &[OjvInputId],
         right_sources: &[OjvInputId],
         join_type: datafusion::logical_expr::JoinType,
-        join_keys: &mut Vec<OjvJoinKeyBinding>,
+        join_keys: &mut Vec<OjvJoinKeyEdge>,
         inputs: &BTreeMap<OjvInputId, OjvJoinInput>,
     ) -> Result<(), IvmError> {
         match filter {
             Expr::BinaryExpr(binary) if binary.op == Operator::And => {
-                self.collect_filter_bindings(
+                self.collect_filter_edges(
                     &binary.left,
                     left_sources,
                     right_sources,
@@ -177,7 +176,7 @@ impl AnalyzerState {
                     join_keys,
                     inputs,
                 )?;
-                self.collect_filter_bindings(
+                self.collect_filter_edges(
                     &binary.right,
                     left_sources,
                     right_sources,
@@ -189,7 +188,7 @@ impl AnalyzerState {
             Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
                 let left_bound = self.sources_of(&binary.left, left_sources, inputs)?;
                 let right_bound = self.sources_of(&binary.right, right_sources, inputs)?;
-                join_keys.push(OjvJoinKeyBinding::for_join(
+                join_keys.push(OjvJoinKeyEdge::for_join(
                     left_bound,
                     right_bound,
                     join_type,

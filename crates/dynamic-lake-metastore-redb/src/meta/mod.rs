@@ -1,4 +1,4 @@
 mod store;
 mod transaction;
 
-pub use store::RedbMetastore;
+pub use store::{RedbMetastore, RedbMetastoreFactory};

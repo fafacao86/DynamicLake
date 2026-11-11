@@ -2,4 +2,4 @@
 
 mod meta;
 
-pub use meta::RedbMetastore;
+pub use meta::{RedbMetastore, RedbMetastoreFactory};

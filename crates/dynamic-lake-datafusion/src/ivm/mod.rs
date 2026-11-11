@@ -19,7 +19,7 @@ pub use delta::{
 pub use error::IvmError;
 pub use normalize::{IvmNormalizer, NormalizedIvmPlan, ROW_ID_COLUMN, normalize_ivm_plan};
 pub use ojv::{
-    ForwardJoinKeyGraph, OjvAnalysis, OjvAnalyzer, OjvInputId, OjvJoinInput, OjvJoinKeyBinding,
+    ForwardJoinKeyGraph, OjvAnalysis, OjvAnalyzer, OjvInputId, OjvJoinInput, OjvJoinKeyEdge,
     OjvJoinNode, OjvJoinTree, OjvMultiJoin, PrimaryDeltaPlanner,
 };
 pub use plan_utils::materialize_ctes;

@@ -46,6 +46,19 @@ pub(super) fn resolve_column(plan: &LogicalPlan, source: &Column) -> Option<Colu
     plan.schema().has_column(source).then(|| source.clone())
 }
 
+pub(super) fn column_by_name(schema: &DFSchema, name: &str) -> Result<Option<Column>> {
+    let mut columns = schema.columns_with_unqualified_name(name).into_iter();
+    let Some(column) = columns.next() else {
+        return Ok(None);
+    };
+    if columns.next().is_some() {
+        return Err(datafusion::error::DataFusionError::Plan(format!(
+            "ambiguous IVM column `{name}`"
+        )));
+    }
+    Ok(Some(column))
+}
+
 const CTE_PREFIX: &str = "__ivm_cte_";
 static NEXT_CTE_ID: AtomicU64 = AtomicU64::new(1);
 

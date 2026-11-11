@@ -3,16 +3,14 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::Instant;
 
-use datafusion::arrow::array::{Array, Int32Array, Int64Array, RecordBatch};
+use datafusion::arrow::array::{Array, Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::prelude::SessionContext;
-use dynamic_lake_client::PipelineClient;
-use dynamic_lake_core::{
-    GraphOperations, IncrementInterval, IvmStreamObject, RowKind, TableIdentifier,
-};
-use dynamic_lake_datafusion::ivm::{IvmRefreshContext, normalize::ROW_KIND_COLUMN};
+use dynamic_lake_client::{InProcessPipelineClient, PipelineClient};
+use dynamic_lake_core::{PipelineError, TableIdentifier};
 use dynamic_lake_format::{CreateDatabaseRequest, CreateTableRequest, LakeFormatRegistry};
+use dynamic_lake_metastore_redb::RedbMetastoreFactory;
 use dynamic_lake_paimon::{PaimonFormat, table_options};
 use paimon::Options;
 
@@ -38,7 +36,16 @@ pub async fn run(row_count: i64, change_count: usize) -> Result<(), Box<dyn Erro
     let catalog = Arc::new(MemoryCatalogProvider::new());
     catalog.register_schema("analytics", Arc::new(MemorySchemaProvider::new()))?;
     session.register_catalog("paimon", catalog);
-    let client = PipelineClient::new(session).with_formats(registry);
+    let metadata_path = warehouse.path().join("metadata.redb");
+    let client = PipelineClient::new(Arc::new(
+        InProcessPipelineClient::new(
+            session.clone(),
+            registry.clone(),
+            &metadata_path,
+            &RedbMetastoreFactory,
+        )
+        .await?,
+    ));
 
     client
         .create_database(
@@ -91,109 +98,65 @@ pub async fn run(row_count: i64, change_count: usize) -> Result<(), Box<dyn Erro
     client.register_table_snapshot(&b).await?;
 
     let view: TableIdentifier = "paimon.analytics.mv".parse()?;
-    let definitions = client
-        .materialized_view_sql(view.to_string(), OJV_SQL)
-        .await?
+    client
+        .materialized_view(view.to_string(), OJV_SQL)
         .create()
         .await?;
-    client.trigger_full_refresh(&definitions, &view).await?;
+    assert!(
+        matches!(
+            client.append_batches(&view, Vec::new()).await,
+            Err(PipelineError::Invalid(_))
+        ),
+        "client writes to a materialized view must be rejected"
+    );
+    client.trigger_full_refresh(&view).await?;
     client.register_table_snapshot(&view).await?;
 
     let downstream: TableIdentifier = "paimon.analytics.mv_downstream".parse()?;
-    let downstream_definitions = client
-        .materialized_view_sql(downstream.to_string(), DOWNSTREAM_SQL)
-        .await?
+    client
+        .materialized_view(downstream.to_string(), DOWNSTREAM_SQL)
         .create()
         .await?;
-    client
-        .trigger_full_refresh(&downstream_definitions, &downstream)
-        .await?;
-    let chain = client
-        .materialized_view(view.to_string(), client.plan_sql(OJV_SQL).await?)?
-        .materialized_view(
-            downstream.to_string(),
-            client.plan_sql(DOWNSTREAM_SQL).await?,
-        )?
-        .build()?;
-    assert!(
-        chain
-            .graph()
-            .node(&downstream)
-            .ok_or("missing downstream MV")?
-            .upstream
-            .contains(&view),
-        "MV dependency graph is missing the upstream MV"
-    );
+    client.trigger_full_refresh(&downstream).await?;
     let downstream_before = visible_rows(client.query_sql(DOWNSTREAM_SQL).await?)?;
-    let before_mv_version = client.latest_version(&view).await?;
-    let mv_stream =
-        IvmStreamObject::create(downstream.clone(), view.clone(), Some(before_mv_version));
 
     let before = visible_rows(client.query_sql(OJV_SQL).await?)?;
-    let a_version = client.latest_version(&a).await?;
-    let before_b_version = client.latest_version(&b).await?;
-    let b_stream = IvmStreamObject::create(view.clone(), b.clone(), Some(before_b_version));
     write_rows(&client, &b, dataset.new_orders, &b_schema).await?;
-    let after_b_version = client.latest_version(&b).await?;
-    let b_interval = b_stream
-        .pending_interval(after_b_version)?
-        .ok_or("expected a changed source")?;
-
-    let refresh = IvmRefreshContext::new(
-        b.clone(),
-        BTreeMap::from([
-            (a.clone(), IncrementInterval::try_new(a_version, a_version)?),
-            (b.clone(), b_interval),
-        ]),
-    )?;
+    let upstream_version = client.latest_version(&view).await?;
     let started = Instant::now();
-    let delta_batches = client
-        .trigger_incremental_refresh(
-            &chain,
-            &view,
-            chain
-                .plan_signature(&view)
-                .ok_or("missing plan signature")?,
-            refresh,
-        )
-        .await?
-        .ok_or("expected incremental changes")?;
+    client.trigger_incremental_refresh(&view).await?;
     let incremental_time = started.elapsed();
-
+    let refreshed_upstream_version = client.latest_version(&view).await?;
+    assert!(
+        refreshed_upstream_version > upstream_version,
+        "incremental refresh did not commit the upstream MV"
+    );
+    client.trigger_incremental_refresh(&view).await?;
+    assert_eq!(
+        client.latest_version(&view).await?,
+        refreshed_upstream_version,
+        "the source cursor was not advanced after the MV commit"
+    );
     let started = Instant::now();
     client.register_table_snapshot(&b).await?;
     let recomputed = visible_rows(client.query_sql(OJV_SQL).await?)?;
     let full_time = started.elapsed();
-    let mut maintained = before;
-    let delta_rows = apply_delta(&mut maintained, &delta_batches)?;
-    assert_eq!(
-        maintained, recomputed,
-        "incremental result differs from full recompute"
-    );
-    let after_mv_version = client.latest_version(&view).await?;
-    let mv_interval = mv_stream
-        .pending_interval(after_mv_version)?
-        .ok_or("expected a changed upstream MV")?;
-    let downstream_refresh = IvmRefreshContext::new(
-        view.clone(),
-        BTreeMap::from([
-            (a.clone(), IncrementInterval::try_new(a_version, a_version)?),
-            (view.clone(), mv_interval),
-        ]),
-    )?;
+    assert_ne!(before, recomputed, "source append produced no view changes");
+    let downstream_version = client.latest_version(&downstream).await?;
     let started = Instant::now();
-    let downstream_delta = client
-        .trigger_incremental_refresh(
-            &chain,
-            &downstream,
-            chain
-                .plan_signature(&downstream)
-                .ok_or("missing downstream plan signature")?,
-            downstream_refresh,
-        )
-        .await?
-        .ok_or("expected downstream incremental changes")?;
+    client.trigger_incremental_refresh(&downstream).await?;
     let downstream_time = started.elapsed();
+    let refreshed_downstream_version = client.latest_version(&downstream).await?;
+    assert!(
+        refreshed_downstream_version > downstream_version,
+        "incremental refresh did not commit the downstream MV"
+    );
+    client.trigger_incremental_refresh(&downstream).await?;
+    assert_eq!(
+        client.latest_version(&downstream).await?,
+        refreshed_downstream_version,
+        "the upstream MV cursor was not advanced after the downstream commit"
+    );
     client.register_table_snapshot(&view).await?;
     let persisted_upstream = visible_rows(
         client
@@ -205,12 +168,9 @@ pub async fn run(row_count: i64, change_count: usize) -> Result<(), Box<dyn Erro
         "persisted upstream MV differs from full recompute"
     );
     let downstream_recomputed = visible_rows(client.query_sql(DOWNSTREAM_SQL).await?)?;
-    let mut downstream_maintained = downstream_before;
-    let downstream_delta_rows = apply_delta(&mut downstream_maintained, &downstream_delta)?;
-    assert!(downstream_delta_rows > 0, "MV-on-MV produced no changes");
-    assert_eq!(
-        downstream_maintained, downstream_recomputed,
-        "MV-on-MV incremental result differs from full recompute"
+    assert_ne!(
+        downstream_before, downstream_recomputed,
+        "MV-on-MV produced no changes"
     );
     client.register_table_snapshot(&downstream).await?;
     let persisted_downstream = visible_rows(
@@ -222,8 +182,32 @@ pub async fn run(row_count: i64, change_count: usize) -> Result<(), Box<dyn Erro
         persisted_downstream, downstream_recomputed,
         "persisted downstream MV differs from full recompute"
     );
+    drop(client);
+    let restarted = PipelineClient::new(Arc::new(
+        InProcessPipelineClient::new(session, registry, &metadata_path, &RedbMetastoreFactory)
+            .await?,
+    ));
+    assert!(
+        matches!(
+            restarted.append_batches(&view, Vec::new()).await,
+            Err(PipelineError::Invalid(_))
+        ),
+        "restarted server must still reject client writes to the MV"
+    );
+    restarted.trigger_incremental_refresh(&view).await?;
+    restarted.trigger_incremental_refresh(&downstream).await?;
+    assert_eq!(
+        restarted.latest_version(&view).await?,
+        refreshed_upstream_version,
+        "restarted server lost the upstream source cursor"
+    );
+    assert_eq!(
+        restarted.latest_version(&downstream).await?,
+        refreshed_downstream_version,
+        "restarted server lost the downstream source cursor"
+    );
     println!(
-        "rows={row_count} changes={change_count} delta_rows={delta_rows} incremental={incremental_time:?} full={full_time:?} downstream_delta_rows={downstream_delta_rows} downstream={downstream_time:?} result_rows={}",
+        "rows={row_count} changes={change_count} incremental={incremental_time:?} full={full_time:?} downstream={downstream_time:?} result_rows={}",
         recomputed.values().sum::<i64>()
     );
     Ok(())
@@ -250,36 +234,4 @@ fn visible_rows(batches: Vec<RecordBatch>) -> Result<Rows, Box<dyn Error>> {
         }
     }
     Ok(rows)
-}
-
-fn apply_delta(rows: &mut Rows, batches: &[RecordBatch]) -> Result<usize, Box<dyn Error>> {
-    let mut count = 0;
-    for batch in batches {
-        let schema = batch.schema();
-        let id = batch
-            .column(schema.index_of("id")?)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or("id is not Int64")?;
-        let b_id = batch
-            .column(schema.index_of("b_id")?)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or("b_id is not Int64")?;
-        let kind = batch
-            .column(schema.index_of(ROW_KIND_COLUMN)?)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .ok_or("row kind is not Int32")?;
-        for row in 0..batch.num_rows() {
-            let key = (id.value(row), (!b_id.is_null(row)).then(|| b_id.value(row)));
-            let sign = kind.value(row);
-            assert!(sign == RowKind::Positive.code() || sign == RowKind::Negative.code());
-            *rows.entry(key).or_default() += i64::from(sign);
-            count += 1;
-        }
-    }
-    rows.retain(|_, count| *count != 0);
-    assert!(rows.values().all(|count| *count > 0));
-    Ok(count)
 }

@@ -156,7 +156,7 @@ fn format_error(error: dynamic_lake_format::LakeFormatError) -> DataFusionError 
     DataFusionError::Execution(error.to_string())
 }
 
-/// Paimon currently marks every source field nullable. Keep the logical source
+/// Paimon.rs currently marks every source field nullable. Keep the logical source
 /// constraints and verify them on each batch produced by the native scan.
 fn adapt_scan_schema(
     execution: Arc<dyn ExecutionPlan>,

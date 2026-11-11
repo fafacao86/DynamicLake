@@ -42,7 +42,6 @@ pub struct IvmStreamObject {
     pub name: String,
     pub mv_node_id: NodeId,
     pub source: TableName,
-    #[serde(alias = "consumed_version")]
     pub last_version: Option<i64>,
     pub status: StreamStatus,
 }
