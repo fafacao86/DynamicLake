@@ -14,6 +14,7 @@ dynamic-lake-format = { path = "../dynamic-lake-format" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 dynamic-lake-metastore-redb = { path = "../dynamic-lake-metastore-redb" }

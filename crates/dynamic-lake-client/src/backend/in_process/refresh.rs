@@ -1,20 +1,23 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::physical_plan::{ExecutionPlan, collect};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use dynamic_lake_core::{
     DynamicTable, GraphExecution, GraphOperations, IncrementInterval, IvmStreamObject,
     MetastoreRepository, NodeExecution, NodeExecutionPlanner, PipelineError, PipelineResult,
     RefreshMode, StreamStatus, TableIdentifier,
 };
+use dynamic_lake_datafusion::ivm::cte::{CteQuery, CteQueryExecutor, collect_with_peak};
 use dynamic_lake_datafusion::ivm::{
     IvmPlanSignatureGenerator, IvmRefreshContext, IvmSnapshotPlanner,
     normalize::materialized_view_plan, plan_incremental_view,
 };
 use dynamic_lake_format::LakeFormatRegistry;
+use tracing::info;
 
 use super::{RegisteredViewSet, metadata_error, table_latest_version};
 
@@ -64,12 +67,12 @@ impl RefreshEngine {
     }
 
     /// Rewrite a view query for one fixed source interval, after checking its plan signature.
-    async fn rewrite_incremental_query(
+    fn rewrite_incremental_query(
         &self,
         view: &TableIdentifier,
         expected_signature: &str,
         refresh: IvmRefreshContext,
-    ) -> PipelineResult<Option<LogicalPlan>> {
+    ) -> PipelineResult<Option<CteQuery>> {
         let node = self.definitions.graph.node(view).ok_or_else(|| {
             PipelineError::Invalid(format!("materialized view `{view}` is not defined"))
         })?;
@@ -80,7 +83,7 @@ impl RefreshEngine {
                 current_signature.sha256
             )));
         }
-        plan_incremental_view(&self.session, &node.query, refresh).await
+        plan_incremental_view(&node.query, refresh)
     }
 
     /// Resolve source versions and streams, then prepare one executable MV refresh.
@@ -88,6 +91,7 @@ impl RefreshEngine {
     async fn plan_incremental_refresh(
         &self,
         node: &DynamicTable,
+        started: Instant,
     ) -> PipelineResult<Option<InProcessNodeExecution>> {
         let view = &node.id;
         let streams = self.definitions.streams.lock().await;
@@ -107,7 +111,7 @@ impl RefreshEngine {
             .any(|stream| stream.last_version.is_none())
         {
             drop(streams);
-            return self.plan_full_node(node).await.map(Some);
+            return self.plan_full_node(node, started).await.map(Some);
         }
         let mut intervals = BTreeMap::new();
         let mut changed = Vec::new();
@@ -141,13 +145,9 @@ impl RefreshEngine {
         let expected_signature = self.definitions.plan_signatures.get(view).ok_or_else(|| {
             PipelineError::Invalid(format!("materialized view `{view}` is not defined"))
         })?;
-        let Some(logical) = self
-            .rewrite_incremental_query(view, expected_signature, refresh)
-            .await?
-        else {
+        let Some(query) = self.rewrite_incremental_query(view, expected_signature, refresh)? else {
             return Ok(None);
         };
-        let execution = self.create_physical_plan(&logical).await?;
         let expected_snapshot = self.latest_version(view).await?;
         let advanced = view_streams
             .values()
@@ -160,13 +160,18 @@ impl RefreshEngine {
         Ok(Some(InProcessNodeExecution {
             engine: self.clone(),
             view: view.clone(),
-            execution,
+            started,
+            execution: PlannedQuery::Cte(query),
             write: RefreshWrite::Changes { expected_snapshot },
             advanced,
         }))
     }
 
-    async fn plan_full_node(&self, node: &DynamicTable) -> PipelineResult<InProcessNodeExecution> {
+    async fn plan_full_node(
+        &self,
+        node: &DynamicTable,
+        started: Instant,
+    ) -> PipelineResult<InProcessNodeExecution> {
         let view = &node.id;
         let streams = self.definitions.streams.lock().await;
         let view_streams = streams.get(view).ok_or_else(|| {
@@ -209,7 +214,8 @@ impl RefreshEngine {
         Ok(InProcessNodeExecution {
             engine: self.clone(),
             view: view.clone(),
-            execution,
+            started,
+            execution: PlannedQuery::Physical(execution),
             write: RefreshWrite::Overwrite,
             advanced,
         })
@@ -241,9 +247,10 @@ impl NodeExecutionPlanner for RefreshEngine {
         node: &DynamicTable,
         mode: RefreshMode,
     ) -> PipelineResult<Option<Box<dyn NodeExecution>>> {
+        let started = Instant::now();
         let execution = match mode {
-            RefreshMode::Full => Some(self.plan_full_node(node).await?),
-            RefreshMode::Incremental => self.plan_incremental_refresh(node).await?,
+            RefreshMode::Full => Some(self.plan_full_node(node, started).await?),
+            RefreshMode::Incremental => self.plan_incremental_refresh(node, started).await?,
         };
         Ok(execution.map(|execution| Box::new(execution) as Box<dyn NodeExecution>))
     }
@@ -258,17 +265,33 @@ enum RefreshWrite {
 struct InProcessNodeExecution {
     engine: RefreshEngine,
     view: TableIdentifier,
-    execution: Arc<dyn ExecutionPlan>,
+    started: Instant,
+    execution: PlannedQuery,
     write: RefreshWrite,
     advanced: Vec<IvmStreamObject>,
+}
+
+enum PlannedQuery {
+    Physical(Arc<dyn ExecutionPlan>),
+    Cte(CteQuery),
 }
 
 #[async_trait]
 impl NodeExecution for InProcessNodeExecution {
     async fn execute(&self) -> PipelineResult<()> {
-        let batches = collect(Arc::clone(&self.execution), self.engine.session.task_ctx())
-            .await
-            .map_err(|error| PipelineError::Execution(error.to_string()))?;
+        let result = match &self.execution {
+            PlannedQuery::Physical(execution) => {
+                collect_with_peak(&self.engine.session, Arc::clone(execution))
+                    .await
+                    .map_err(|error| PipelineError::Execution(error.to_string()))?
+            }
+            PlannedQuery::Cte(query) => CteQueryExecutor::new(&self.engine.session)
+                .execute(query)
+                .await
+                .map_err(|error| PipelineError::Execution(error.to_string()))?,
+        };
+        let peak_memory_bytes = result.peak_memory_bytes;
+        let batches = result.batches;
         match self.write {
             RefreshWrite::Overwrite => self
                 .engine
@@ -293,6 +316,12 @@ impl NodeExecution for InProcessNodeExecution {
         for stream in &self.advanced {
             view_streams.insert(stream.source.clone(), stream.clone());
         }
+        let mode = match self.write {
+            RefreshWrite::Overwrite => "full",
+            RefreshWrite::Changes { .. } => "incremental",
+        };
+        info!(view = %self.view, mode, elapsed_ms = self.started.elapsed().as_millis(),
+            query_peak_memory_bytes = peak_memory_bytes, "materialized view refresh completed");
         Ok(())
     }
 }

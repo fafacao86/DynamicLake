@@ -1,11 +1,10 @@
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::prelude::SessionContext;
 use dynamic_lake_core::{PipelineError, PipelineResult};
 
+use crate::ivm::cte::CteQuery;
 use crate::ivm::error::IvmError;
 use crate::ivm::normalize::{materialized_view_delta_plan, row_id_columns};
 use crate::ivm::ojv::OjvAnalyzer;
-use crate::ivm::plan_utils::materialize_ctes;
 
 use super::IvmRefreshContext;
 use super::context::IvmDeltaRewriteContext;
@@ -86,11 +85,10 @@ impl IvmRewriter {
 }
 
 /// Build the complete incremental MV query from a normalized definition.
-pub async fn plan_incremental_view(
-    session: &SessionContext,
+pub fn plan_incremental_view(
     normalized: &LogicalPlan,
     refresh: IvmRefreshContext,
-) -> PipelineResult<Option<LogicalPlan>> {
+) -> PipelineResult<Option<CteQuery>> {
     let rewriter = IvmRewriter::new(normalized, refresh)
         .map_err(|error| PipelineError::Invalid(error.to_string()))?;
     let Some(delta) = rewriter
@@ -99,12 +97,11 @@ pub async fn plan_incremental_view(
     else {
         return Ok(None);
     };
-    let cached = materialize_ctes(session, delta)
-        .await
-        .map_err(|error| PipelineError::Execution(error.to_string()))?;
-    let plan = materialized_view_delta_plan(cached, row_id_columns(normalized.schema()).len())
+    let plan = materialized_view_delta_plan(delta, row_id_columns(normalized.schema()).len())
         .map_err(|error| PipelineError::Invalid(error.to_string()))?;
-    Ok(Some(plan))
+    Ok(Some(CteQuery::new(plan).map_err(|error| {
+        PipelineError::Invalid(error.to_string())
+    })?))
 }
 
 #[cfg(test)]

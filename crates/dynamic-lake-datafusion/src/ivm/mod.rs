@@ -4,6 +4,7 @@
 //! It owns materialized-view normalization, OJV analysis, and incremental plan
 //! construction over DataFusion logical plans.
 
+pub mod cte;
 pub mod delta;
 pub mod error;
 pub mod normalize;
@@ -23,6 +24,5 @@ pub use ojv::{
     ForwardJoinKeyGraph, OjvAnalysis, OjvAnalyzer, OjvInputId, OjvJoinInput, OjvJoinKeyEdge,
     OjvJoinNode, OjvJoinTree, OjvMultiJoin, PrimaryDeltaPlanner,
 };
-pub use plan_utils::materialize_ctes;
 pub use signature::{IvmPlanSignature, IvmPlanSignatureGenerator};
 pub use view_compiler::{canonical_view_id, compile_view_definitions};
