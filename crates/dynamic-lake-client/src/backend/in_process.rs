@@ -31,9 +31,11 @@ struct RegisteredViewSet {
 impl RegisteredViewSet {
     async fn build(
         session: &SessionContext,
+        formats: &LakeFormatRegistry,
         definitions: Vec<(ViewDefinition, PipelineBuildOptions)>,
     ) -> PipelineResult<Self> {
-        let (graph, plan_signatures) = compile_view_definitions(session, definitions).await?;
+        let (graph, plan_signatures) =
+            compile_view_definitions(session, formats, definitions).await?;
         let streams = graph
             .nodes()
             .iter()
@@ -271,6 +273,7 @@ mod tests {
         .await?;
         let planned = RegisteredViewSet::build(
             &backend.session,
+            &backend.formats,
             vec![
                 (
                     ViewDefinition {

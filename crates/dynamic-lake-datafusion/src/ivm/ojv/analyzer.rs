@@ -236,7 +236,9 @@ mod tests {
                  LEFT JOIN c ON b_id = c_id",
             )
             .await?;
-        let normalized = IvmNormalizer::default().normalize(plan)?;
+        let normalized = IvmNormalizer::default()
+            .normalize(plan, &dynamic_lake_format::LakeFormatRegistry::new())
+            .await?;
         let analysis = OjvAnalyzer.analyze(&normalized.plan)?;
         assert_eq!(analysis.multi_joins.len(), 1);
         let multi_join = &analysis.multi_joins[0];
@@ -287,7 +289,9 @@ mod tests {
             ),
         ] {
             let plan = session.state().create_logical_plan(sql).await?;
-            let normalized = IvmNormalizer::default().normalize(plan)?;
+            let normalized = IvmNormalizer::default()
+                .normalize(plan, &dynamic_lake_format::LakeFormatRegistry::new())
+                .await?;
             assert!(matches!(
                 OjvAnalyzer.analyze(&normalized.plan),
                 Err(IvmError::UnsupportedJoinType(rejected)) if rejected == join_type

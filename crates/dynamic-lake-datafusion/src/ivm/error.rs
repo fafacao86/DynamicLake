@@ -16,6 +16,8 @@ pub enum IvmError {
     MissingGraphInput(OjvInputId),
     #[error("source table `{table}` has no row-id column `{column}`")]
     MissingSourceRowId { table: String, column: String },
+    #[error("failed to resolve row identity: {0}")]
+    SourceMetadata(String),
     #[error("source row-id column `{0}` must be non-null")]
     NullableSourceRowId(String),
     #[error("expected exactly one IVM row-id column, found {0}")]

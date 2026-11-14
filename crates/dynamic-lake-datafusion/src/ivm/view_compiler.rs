@@ -12,6 +12,7 @@ use dynamic_lake_core::{
     PipelineBuildOptions, PipelineError, PipelineGraph, PipelineResult, TableIdentifier,
     ViewDefinition, build_view_graph,
 };
+use dynamic_lake_format::LakeFormatRegistry;
 
 use crate::DataFusionPlanOptimizer;
 
@@ -20,6 +21,7 @@ use super::{IvmNormalizer, IvmPlanSignatureGenerator};
 /// Compile SQL definitions into a dependency graph and signatures of its plans.
 pub async fn compile_view_definitions(
     session: &SessionContext,
+    formats: &LakeFormatRegistry,
     definitions: Vec<(ViewDefinition, PipelineBuildOptions)>,
 ) -> PipelineResult<(PipelineGraph, BTreeMap<TableIdentifier, String>)> {
     let optimizer = DataFusionPlanOptimizer::new(session.state());
@@ -32,7 +34,8 @@ pub async fn compile_view_definitions(
             .map_err(|error| PipelineError::Execution(error.to_string()))?;
         let optimized = optimizer.optimize(query)?;
         let normalized = IvmNormalizer::default()
-            .normalize(optimized)
+            .normalize(optimized, formats)
+            .await
             .map_err(|error| PipelineError::Invalid(format!("IVM normalize failed: {error}")))?;
         drafts.push(prepare_table(definition.name, normalized.plan, &options)?);
     }

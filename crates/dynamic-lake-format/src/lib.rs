@@ -42,12 +42,22 @@ pub enum FormatCapability {
 ///
 /// The registry resolves table names to a format, while `catalog` and `planner`
 /// keep DDL/metadata and read/write planning as independent implementations.
+#[async_trait]
 pub trait LakeFormat: Send + Sync {
     fn name(&self) -> &str;
     fn kind(&self) -> LakeFormatKind;
     fn capabilities(&self) -> &[FormatCapability];
     fn catalog(&self) -> &dyn LakeCatalog;
     fn planner(&self) -> &dyn LakeTablePlanner;
+
+    async fn get_identity_columns(
+        &self,
+        table: &dynamic_lake_core::TableIdentifier,
+    ) -> LakeFormatResult<Vec<String>> {
+        Err(LakeFormatError::Unsupported(format!(
+            "row identity for table `{table}`"
+        )))
+    }
 }
 
 /// Hook for formats whose version provider requires runtime access beyond the

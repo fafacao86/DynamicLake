@@ -5,11 +5,16 @@ pub mod row_id;
 
 use std::sync::Arc;
 
+use async_recursion::async_recursion;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::common::Column;
 use datafusion::logical_expr::logical_plan::{Aggregate, Join, Projection, TableScan, Union};
 use datafusion::logical_expr::{Expr, ExprSchemable, JoinType, LogicalPlan};
+use dynamic_lake_format::LakeFormatRegistry;
 
 use crate::ivm::error::IvmError;
+
+use super::plan_utils::table_identifier;
 
 pub use hash::{IvmSha1, ivm_sha1, ivm_sha1_expr, register_ivm_functions};
 pub use row_id::{
@@ -33,39 +38,36 @@ impl NormalizedIvmPlan {
 }
 
 /// Adds stable hidden row identities to a materialized-view definition.
-///
-/// This follows the Polars IVM normalizer: scans expose the configured source
-/// row-id, joins retain one row-id for every input, and unions create a
-/// branch-scoped hash identity. A final join hash is intentionally left to the
-/// OJV planner.
-#[derive(Debug, Clone)]
-pub struct IvmNormalizer {
-    source_row_id: String,
-}
-
-impl Default for IvmNormalizer {
-    fn default() -> Self {
-        Self::new(ROW_ID_COLUMN)
-    }
-}
+#[derive(Debug, Clone, Default)]
+pub struct IvmNormalizer;
 
 impl IvmNormalizer {
-    pub fn new(source_row_id: impl Into<String>) -> Self {
-        Self {
-            source_row_id: source_row_id.into(),
-        }
+    pub async fn normalize(
+        &self,
+        plan: LogicalPlan,
+        formats: &LakeFormatRegistry,
+    ) -> Result<NormalizedIvmPlan, IvmError> {
+        Ok(NormalizedIvmPlan::new(
+            self.normalize_plan(plan, formats).await?,
+        ))
     }
 
-    pub fn normalize(&self, plan: LogicalPlan) -> Result<NormalizedIvmPlan, IvmError> {
-        Ok(NormalizedIvmPlan::new(self.normalize_plan(plan)?))
-    }
-
-    fn normalize_plan(&self, plan: LogicalPlan) -> Result<LogicalPlan, IvmError> {
+    #[async_recursion]
+    async fn normalize_plan(
+        &self,
+        plan: LogicalPlan,
+        formats: &LakeFormatRegistry,
+    ) -> Result<LogicalPlan, IvmError> {
         match plan {
-            LogicalPlan::TableScan(scan) => self.normalize_scan(scan),
-            LogicalPlan::Projection(projection) => self.normalize_projection(projection),
+            LogicalPlan::TableScan(scan) => self.normalize_scan(scan, formats).await,
+            LogicalPlan::Projection(projection) => {
+                self.normalize_projection(projection, formats).await
+            }
             LogicalPlan::Filter(filter) => {
-                let input = Arc::new(self.normalize_plan((*filter.input).clone())?);
+                let input = Arc::new(
+                    self.normalize_plan((*filter.input).clone(), formats)
+                        .await?,
+                );
                 Ok(LogicalPlan::Filter(
                     datafusion::logical_expr::logical_plan::Filter::try_new(
                         filter.predicate,
@@ -73,9 +75,9 @@ impl IvmNormalizer {
                     )?,
                 ))
             }
-            LogicalPlan::Join(join) => self.normalize_join(join),
-            LogicalPlan::Union(union) => self.normalize_union(union),
-            LogicalPlan::Aggregate(aggregate) => self.normalize_aggregate(aggregate),
+            LogicalPlan::Join(join) => self.normalize_join(join, formats).await,
+            LogicalPlan::Union(union) => self.normalize_union(union, formats).await,
+            LogicalPlan::Aggregate(aggregate) => self.normalize_aggregate(aggregate, formats).await,
             LogicalPlan::EmptyRelation(empty) => Ok(LogicalPlan::Projection(Projection::try_new(
                 vec![datafusion::logical_expr::lit(0_i64).alias(ROW_ID_COLUMN)],
                 Arc::new(LogicalPlan::EmptyRelation(empty)),
@@ -84,27 +86,68 @@ impl IvmNormalizer {
         }
     }
 
-    fn normalize_scan(&self, scan: TableScan) -> Result<LogicalPlan, IvmError> {
+    async fn normalize_scan(
+        &self,
+        scan: TableScan,
+        formats: &LakeFormatRegistry,
+    ) -> Result<LogicalPlan, IvmError> {
         let source_schema = scan.source.schema();
-        let (row_id_index, row_id_field) = source_schema
+        let identity_columns = if source_schema
             .fields()
             .iter()
-            .enumerate()
-            .find(|(_, field)| field.name() == &self.source_row_id)
-            .ok_or_else(|| IvmError::MissingSourceRowId {
-                table: scan.table_name.to_string(),
-                column: self.source_row_id.clone(),
+            .any(|field| field.name() == ROW_ID_COLUMN)
+        {
+            vec![ROW_ID_COLUMN.to_string()]
+        } else {
+            let table = table_identifier(&scan.table_name)?;
+            let catalog = table.parts().first().ok_or_else(|| {
+                IvmError::SourceMetadata(format!("table `{table}` has no catalog"))
             })?;
-        if row_id_field.is_nullable() {
-            return Err(IvmError::NullableSourceRowId(self.source_row_id.clone()));
-        }
+            let format = formats.format(catalog).ok_or_else(|| {
+                IvmError::SourceMetadata(format!("no lake format registered for `{catalog}`"))
+            })?;
+            format
+                .get_identity_columns(&table)
+                .await
+                .map_err(|error| IvmError::SourceMetadata(error.to_string()))?
+        };
+        self.add_identity_projection(scan, identity_columns)
+    }
 
-        let mut projection = scan
+    fn add_identity_projection(
+        &self,
+        scan: TableScan,
+        identity_columns: Vec<String>,
+    ) -> Result<LogicalPlan, IvmError> {
+        let source_schema = scan.source.schema();
+        let original_projection = scan
             .projection
             .clone()
             .unwrap_or_else(|| (0..source_schema.fields().len()).collect::<Vec<_>>());
-        if !projection.contains(&row_id_index) {
-            projection.push(row_id_index);
+        if identity_columns.is_empty() {
+            return Err(IvmError::MissingSourceRowId {
+                table: scan.table_name.to_string(),
+                column: ROW_ID_COLUMN.to_string(),
+            });
+        }
+
+        let mut projection = original_projection.clone();
+        for column in &identity_columns {
+            let (index, field) = source_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .find(|(_, field)| field.name() == column)
+                .ok_or_else(|| IvmError::MissingSourceRowId {
+                    table: scan.table_name.to_string(),
+                    column: column.clone(),
+                })?;
+            if field.is_nullable() {
+                return Err(IvmError::NullableSourceRowId(column.clone()));
+            }
+            if !projection.contains(&index) {
+                projection.push(index);
+            }
         }
         let scan = TableScan::try_new(
             scan.table_name.clone(),
@@ -113,32 +156,43 @@ impl IvmNormalizer {
             scan.filters,
             scan.fetch,
         )?;
-
-        if self.source_row_id == ROW_ID_COLUMN {
-            Ok(LogicalPlan::TableScan(scan))
-        } else {
-            let mut exprs = scan
-                .projected_schema
-                .columns()
-                .into_iter()
-                .map(Expr::Column)
-                .collect::<Vec<_>>();
-            exprs.push(
-                Expr::Column(datafusion::common::Column::new(
-                    Some(scan.table_name.clone()),
-                    self.source_row_id.clone(),
-                ))
-                .alias_qualified(Some(scan.table_name.clone()), ROW_ID_COLUMN),
-            );
-            Ok(LogicalPlan::Projection(Projection::try_new(
-                exprs,
-                Arc::new(LogicalPlan::TableScan(scan)),
-            )?))
+        if identity_columns.len() == 1 && identity_columns[0] == ROW_ID_COLUMN {
+            return Ok(LogicalPlan::TableScan(scan));
         }
+
+        let qualifier = Some(scan.table_name.clone());
+        let mut exprs = original_projection
+            .into_iter()
+            .map(|index| {
+                Expr::Column(Column::new(
+                    qualifier.clone(),
+                    source_schema.field(index).name(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let identity = identity_columns
+            .into_iter()
+            .map(|column| Expr::Column(Column::new(qualifier.clone(), column)))
+            .collect::<Vec<_>>();
+        exprs.push(
+            ivm_sha1_expr(RowIdDomain::Source, identity)
+                .alias_qualified(qualifier.clone(), ROW_ID_COLUMN),
+        );
+        Ok(LogicalPlan::Projection(Projection::try_new(
+            exprs,
+            Arc::new(LogicalPlan::TableScan(scan)),
+        )?))
     }
 
-    fn normalize_projection(&self, projection: Projection) -> Result<LogicalPlan, IvmError> {
-        let input = Arc::new(self.normalize_plan((*projection.input).clone())?);
+    async fn normalize_projection(
+        &self,
+        projection: Projection,
+        formats: &LakeFormatRegistry,
+    ) -> Result<LogicalPlan, IvmError> {
+        let input = Arc::new(
+            self.normalize_plan((*projection.input).clone(), formats)
+                .await?,
+        );
         let mut exprs = projection.expr;
         for column in row_id_columns(input.schema()) {
             if !projection.schema.has_column(&column) {
@@ -148,15 +202,19 @@ impl IvmNormalizer {
         Ok(LogicalPlan::Projection(Projection::try_new(exprs, input)?))
     }
 
-    fn normalize_join(&self, join: Join) -> Result<LogicalPlan, IvmError> {
+    async fn normalize_join(
+        &self,
+        join: Join,
+        formats: &LakeFormatRegistry,
+    ) -> Result<LogicalPlan, IvmError> {
         if !matches!(
             join.join_type,
             JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
         ) {
             return Err(IvmError::UnsupportedJoinType(join.join_type));
         }
-        let left = Arc::new(self.normalize_plan((*join.left).clone())?);
-        let right = Arc::new(self.normalize_plan((*join.right).clone())?);
+        let left = Arc::new(self.normalize_plan((*join.left).clone(), formats).await?);
+        let right = Arc::new(self.normalize_plan((*join.right).clone(), formats).await?);
         Ok(LogicalPlan::Join(Join::try_new(
             left,
             right,
@@ -169,11 +227,15 @@ impl IvmNormalizer {
         )?))
     }
 
-    fn normalize_union(&self, union: Union) -> Result<LogicalPlan, IvmError> {
+    async fn normalize_union(
+        &self,
+        union: Union,
+        formats: &LakeFormatRegistry,
+    ) -> Result<LogicalPlan, IvmError> {
         let output_width = union.schema.fields().len();
         let mut inputs = Vec::with_capacity(union.inputs.len());
         for (branch, input) in union.inputs.into_iter().enumerate() {
-            let input = Arc::new(self.normalize_plan((*input).clone())?);
+            let input = Arc::new(self.normalize_plan((*input).clone(), formats).await?);
             let row_id = single_row_id(&input)?;
             let mut exprs = input
                 .schema()
@@ -194,9 +256,16 @@ impl IvmNormalizer {
         Ok(LogicalPlan::Union(Union::try_new(inputs)?))
     }
 
-    fn normalize_aggregate(&self, aggregate: Aggregate) -> Result<LogicalPlan, IvmError> {
+    async fn normalize_aggregate(
+        &self,
+        aggregate: Aggregate,
+        formats: &LakeFormatRegistry,
+    ) -> Result<LogicalPlan, IvmError> {
         let group_key_count = aggregate.group_expr.len();
-        let input = Arc::new(self.normalize_plan((*aggregate.input).clone())?);
+        let input = Arc::new(
+            self.normalize_plan((*aggregate.input).clone(), formats)
+                .await?,
+        );
         let aggregate = Aggregate::try_new(input, aggregate.group_expr, aggregate.aggr_expr)?;
         let group_keys = aggregate
             .schema
@@ -219,8 +288,11 @@ impl IvmNormalizer {
     }
 }
 
-pub fn normalize_ivm_plan(plan: LogicalPlan) -> Result<NormalizedIvmPlan, IvmError> {
-    IvmNormalizer::default().normalize(plan)
+pub async fn normalize_ivm_plan(
+    plan: LogicalPlan,
+    formats: &LakeFormatRegistry,
+) -> Result<NormalizedIvmPlan, IvmError> {
+    IvmNormalizer::default().normalize(plan, formats).await
 }
 
 /// Build the persisted schema of a normalized IVM view.
@@ -322,6 +394,8 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::TableReference;
+    use datafusion::datasource::default_table_source::DefaultTableSource;
     use datafusion::datasource::empty::EmptyTable;
     use datafusion::prelude::SessionContext;
 
@@ -355,7 +429,9 @@ mod tests {
             .state()
             .create_logical_plan("SELECT a_id, b_id FROM a LEFT JOIN b ON a_id = b_id")
             .await?;
-        let normalized = normalize_ivm_plan(plan).expect("normalize left join");
+        let normalized = normalize_ivm_plan(plan, &LakeFormatRegistry::new())
+            .await
+            .expect("normalize left join");
 
         assert_eq!(row_id_columns(normalized.plan.schema()).len(), 2);
         assert!(
@@ -377,7 +453,9 @@ mod tests {
             .state()
             .create_logical_plan("SELECT k FROM a UNION ALL SELECT k FROM b")
             .await?;
-        let normalized = normalize_ivm_plan(plan).expect("normalize union");
+        let normalized = normalize_ivm_plan(plan, &LakeFormatRegistry::new())
+            .await
+            .expect("normalize union");
         let display = normalized.plan.display_indent().to_string();
 
         assert_eq!(row_id_columns(normalized.plan.schema()).len(), 1);
@@ -386,16 +464,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_source_row_id_is_exposed_as_ivm_row_id()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let session = session_with_tables(&[("a", &["_ROW_ID", "k"])]).await?;
-        let plan = session
-            .state()
-            .create_logical_plan("SELECT k FROM a")
-            .await?;
-        let normalized = IvmNormalizer::new("_ROW_ID").normalize(plan)?;
+    async fn primary_key_is_hashed_into_hidden_row_id() -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("k", DataType::Int64, false),
+        ]));
+        let source = Arc::new(DefaultTableSource::new(Arc::new(EmptyTable::new(schema))));
+        let scan = TableScan::try_new(
+            TableReference::bare("a"),
+            source,
+            Some(vec![1]),
+            Vec::new(),
+            None,
+        )?;
+        let normalized =
+            IvmNormalizer::default().add_identity_projection(scan, vec!["id".to_string()])?;
 
-        assert_eq!(row_id_columns(normalized.plan.schema()).len(), 1);
+        let names = normalized
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["k", ROW_ID_COLUMN]);
+        assert!(
+            normalized
+                .display_indent()
+                .to_string()
+                .contains("_ivm_sha1")
+        );
         Ok(())
     }
 }

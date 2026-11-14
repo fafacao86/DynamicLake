@@ -42,7 +42,9 @@ mod tests {
         sql: &str,
     ) -> Result<IvmPlanSignature, Box<dyn std::error::Error>> {
         let plan = session.state().create_logical_plan(sql).await?;
-        let normalized = IvmNormalizer::default().normalize(plan)?;
+        let normalized = IvmNormalizer::default()
+            .normalize(plan, &dynamic_lake_format::LakeFormatRegistry::new())
+            .await?;
         Ok(IvmPlanSignatureGenerator.generate(&normalized.plan))
     }
 

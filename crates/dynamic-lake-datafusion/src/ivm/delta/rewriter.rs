@@ -155,7 +155,9 @@ mod tests {
     ) -> Result<Option<LogicalPlan>, Box<dyn std::error::Error>> {
         let session = session().await?;
         let plan = session.state().create_logical_plan(sql).await?;
-        let normalized = IvmNormalizer::default().normalize(plan)?;
+        let normalized = IvmNormalizer::default()
+            .normalize(plan, &dynamic_lake_format::LakeFormatRegistry::new())
+            .await?;
         Ok(IvmRewriter::new(&normalized.plan, refresh(changed))?
             .rewrite_outer_join_primary(&normalized.plan)?)
     }

@@ -19,6 +19,7 @@ impl InProcessPipelineClient {
         }
         let mut view_set = RegisteredViewSet::build(
             &self.session,
+            &self.formats,
             stored
                 .iter()
                 .map(|definition| {
@@ -132,7 +133,8 @@ impl InProcessPipelineClient {
                     .map(|definition| (definition, options.clone())),
             )
             .collect();
-        let mut view_set = RegisteredViewSet::build(&self.session, all_definitions).await?;
+        let mut view_set =
+            RegisteredViewSet::build(&self.session, &self.formats, all_definitions).await?;
         self.restore_streams(&mut view_set, &existing).await?;
         let mut new_metadata = Vec::with_capacity(definitions.len());
         for definition in definitions {

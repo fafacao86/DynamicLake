@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-recursion.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
 dynamic-lake-core = { path = "../dynamic-lake-core" }

@@ -430,7 +430,9 @@ mod tests {
                  LEFT JOIN (b LEFT JOIN c ON b_id = c_id) ON a_id = b_id",
             )
             .await?;
-        let normalized = IvmNormalizer::default().normalize(plan)?;
+        let normalized = IvmNormalizer::default()
+            .normalize(plan, &dynamic_lake_format::LakeFormatRegistry::new())
+            .await?;
         let analysis = OjvAnalyzer.analyze(&normalized.plan)?;
         let multi_join = &analysis.multi_joins[0];
         assert_eq!(multi_join.inputs.len(), 3);
@@ -473,7 +475,9 @@ mod tests {
                  LEFT JOIN (b LEFT JOIN c ON b_id = c_id) ON a_id = c_id",
             )
             .await?;
-        let normalized = IvmNormalizer::default().normalize(plan)?;
+        let normalized = IvmNormalizer::default()
+            .normalize(plan, &dynamic_lake_format::LakeFormatRegistry::new())
+            .await?;
         let analysis = OjvAnalyzer.analyze(&normalized.plan)?;
         let multi_join = &analysis.multi_joins[0];
         assert_eq!(multi_join.inputs.len(), 3);
@@ -536,7 +540,9 @@ mod tests {
                  LEFT JOIN (b LEFT JOIN c ON b_id = c_id) ON a_id = b_id",
             )
             .await?;
-        let normalized = IvmNormalizer::default().normalize(plan)?;
+        let normalized = IvmNormalizer::default()
+            .normalize(plan, &dynamic_lake_format::LakeFormatRegistry::new())
+            .await?;
         let analysis = OjvAnalyzer.analyze(&normalized.plan)?;
         let multi_join = &analysis.multi_joins[0];
         let rewritten = multi_join
@@ -598,7 +604,8 @@ mod tests {
             .create_logical_plan("SELECT a_id, b_id FROM a LEFT JOIN b ON a_id = b_id")
             .await?;
         let normalized = IvmNormalizer::default()
-            .normalize(plan)
+            .normalize(plan, &dynamic_lake_format::LakeFormatRegistry::new())
+            .await
             .expect("normalize left join");
         let analysis = OjvAnalyzer
             .analyze(&normalized.plan)

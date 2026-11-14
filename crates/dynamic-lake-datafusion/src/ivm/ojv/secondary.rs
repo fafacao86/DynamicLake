@@ -380,7 +380,9 @@ mod tests {
             .state()
             .create_logical_plan("SELECT a_id, b_id FROM a LEFT JOIN b ON a_id = b_id")
             .await?;
-        let normalized = IvmNormalizer::default().normalize(plan)?;
+        let normalized = IvmNormalizer::default()
+            .normalize(plan, &dynamic_lake_format::LakeFormatRegistry::new())
+            .await?;
         let analysis = OjvAnalyzer.analyze(&normalized.plan)?;
         let multi_join = &analysis.multi_joins[0];
         let LogicalPlan::TableScan(delta_scan) =

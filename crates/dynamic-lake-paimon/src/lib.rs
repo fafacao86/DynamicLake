@@ -103,6 +103,7 @@ pub fn normalize_managed_table_options(properties: Vec<(String, String)>) -> Vec
     options
 }
 
+#[async_trait]
 impl LakeFormat for PaimonFormat {
     fn name(&self) -> &str {
         "paimon"
@@ -122,6 +123,29 @@ impl LakeFormat for PaimonFormat {
 
     fn planner(&self) -> &dyn LakeTablePlanner {
         self
+    }
+
+    async fn get_identity_columns(&self, table: &TableIdentifier) -> LakeFormatResult<Vec<String>> {
+        let identifier = paimon_identifier(table.parts())?;
+        let paimon_table = self
+            .catalog
+            .get_table(&identifier)
+            .await
+            .map_err(catalog_error)?;
+        let schema = paimon_table.schema();
+        if schema
+            .fields()
+            .iter()
+            .any(|field| field.name() == "__ivm_row_id")
+        {
+            return Ok(vec!["__ivm_row_id".to_string()]);
+        }
+        if schema.primary_keys().is_empty() {
+            return Err(LakeFormatError::Unsupported(format!(
+                "table `{table}` has neither a persisted row identity nor a primary key"
+            )));
+        }
+        Ok(schema.primary_keys().to_vec())
     }
 }
 
